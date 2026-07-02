@@ -1,5 +1,5 @@
 """
-XTX 竞品规格书解析与对标推荐工具 V4
+XTX 竞品规格书解析与对标推荐工具 V5
 =================================
 运行方式：
     pip install -r requirements.txt
@@ -36,7 +36,7 @@ from rapidfuzz import fuzz
 # =========================================================
 
 st.set_page_config(
-    page_title="竞品规格书解析与 XTX 对标推荐工具 V4",
+    page_title="竞品规格书解析与 XTX 对标推荐工具 V5",
     page_icon="🔎",
     layout="wide",
 )
@@ -490,14 +490,57 @@ def normalize_header_name(name: str) -> str:
     return n or "col"
 
 
+
 def table_rows_containing_model(html: str, model: str, current_url: str) -> list[dict]:
-    """从官网产品页 HTML 表格中抽取包含目标型号的行。"""
-    soup = BeautifulSoup(html, "html.parser")
+    """从官网产品页 HTML 表格中抽取包含目标型号的行。
+
+    V5 优化：
+    1. 优先用 pandas.read_html 解析标准表格，避免把整页文本当成一行，导致 7 + 4Mb 被误识别成 74Mb。
+    2. 再用 BeautifulSoup 兜底解析非标准表格。
+    3. 仅返回包含完整目标型号的表格行；不把普通页面文本用于容量/电压抽取。
+    """
     model_norm = normalize_model(model)
-    rows_out = []
+    rows_out: list[dict] = []
     if not model_norm:
         return rows_out
 
+    # 方式一：pandas.read_html 对 Boya 这类标准产品表格更稳定。
+    try:
+        html_tables = pd.read_html(io.StringIO(html))
+        for table_idx, df in enumerate(html_tables):
+            if df.empty:
+                continue
+            df = df.copy()
+            df.columns = [normalize_header_name(str(c)) for c in df.columns]
+            # 如果表头没有识别到型号列，也保留所有列用于 row_text 匹配。
+            for row_idx, r in df.iterrows():
+                values = ["" if pd.isna(v) else str(v).strip() for v in r.tolist()]
+                row_text = " ".join(values)
+                if model_norm not in normalize_model(row_text):
+                    continue
+                row = {
+                    "source_url": current_url,
+                    "table_index": table_idx,
+                    "row_index": int(row_idx),
+                    "row_text": row_text,
+                }
+                for col, val in zip(df.columns, values):
+                    key = normalize_header_name(col)
+                    if not key:
+                        continue
+                    if key in row and str(row[key]).strip():
+                        row[key] = f"{row[key]} | {val}"
+                    else:
+                        row[key] = val
+                rows_out.append(row)
+    except Exception:
+        pass
+
+    if rows_out:
+        return rows_out
+
+    # 方式二：BeautifulSoup 兜底。
+    soup = BeautifulSoup(html, "html.parser")
     for table_idx, table in enumerate(soup.find_all("table")):
         trs = table.find_all("tr")
         if not trs:
@@ -505,11 +548,12 @@ def table_rows_containing_model(html: str, model: str, current_url: str) -> list
 
         headers = []
         header_tr_index = 0
-        for i, tr in enumerate(trs[:3]):
+        for i, tr in enumerate(trs[:5]):
             cells = tr.find_all(["th", "td"])
             texts = [c.get_text(" ", strip=True) for c in cells]
-            if any(normalize_header_name(t) in ["density", "part_no", "vcc", "package", "temperature"] for t in texts):
-                headers = [normalize_header_name(t) for t in texts]
+            normalized = [normalize_header_name(t) for t in texts]
+            if any(t in ["density", "part_no", "vcc", "package", "temperature", "status"] for t in normalized):
+                headers = normalized
                 header_tr_index = i
                 break
 
@@ -530,14 +574,13 @@ def table_rows_containing_model(html: str, model: str, current_url: str) -> list
             row = {"source_url": current_url, "table_index": table_idx, "row_text": row_text}
             for idx, value in enumerate(values):
                 key = headers[idx] if idx < len(headers) and headers[idx] else f"col_{idx}"
-                # 避免重复表头覆盖，把重复列拼接起来
+                key = normalize_header_name(key)
                 if key in row and str(row[key]).strip():
                     row[key] = f"{row[key]} | {value}"
                 else:
                     row[key] = value
             rows_out.append(row)
     return rows_out
-
 
 def extract_pdf_links_from_page(html: str, current_url: str, domain: str, model: str) -> list[dict]:
     links = extract_links_from_html(html, current_url)
@@ -655,23 +698,49 @@ def crawl_product_pages_parallel(search_df: pd.DataFrame, model: str, max_pages:
     return pd.concat(dfs, ignore_index=True).sort_values("page_score", ascending=False).drop_duplicates(subset=["page_url", "row_text"])
 
 
+
+def get_first_non_empty(row: pd.Series, keys: list[str]) -> str:
+    """从产品页表格行中按多个可能字段名取第一个非空值。"""
+    for key in keys:
+        if key in row.index:
+            val = row.get(key, "")
+            if val is not None and str(val).strip() not in ["", "nan", "None"]:
+                return str(val).strip()
+    return ""
+
+
 def spec_from_product_page_row(row: pd.Series, selected_type: str, model: str) -> dict:
-    """把官网产品页表格行转换成统一 spec。"""
+    """把官网产品页表格行转换成统一 spec。
+
+    V5：只有 source_kind=官网产品页表格 时，才从行字段抽取容量/电压/封装/温度；
+    如果只是普通页面文本命中型号，为避免误识别，容量/电压/封装/温度留空，交给选型下拉修正。
+    """
     row_text = str(row.get("row_text", ""))
-    density_text = str(row.get("density", "")) or row_text
-    vcc_text = str(row.get("vcc", "")) or row_text
-    package_text = str(row.get("package", "")) or row_text
-    temp_text = str(row.get("temperature", "")) or row_text
+    source_kind = str(row.get("source_kind", ""))
+    is_table_source = "表格" in source_kind or bool(get_first_non_empty(row, ["part_no", "density", "vcc", "package", "temperature"]))
 
     product_type = extract_product_type(row_text, selected_type=selected_type, model=model)
-    density_mb, density_display = parse_density_from_text(density_text)
-    if density_mb is None:
-        d = extract_density(row_text)
-        density_mb, density_display = d.get("density_mb"), d.get("display", "")
-    vmin, vmax = parse_voltage_from_text(vcc_text)
-    voltage = build_voltage_dict(vmin, vmax, "产品页")
-    package = extract_package(package_text)
-    temp = extract_temperature(temp_text)
+
+    density_mb, density_display = None, ""
+    voltage = build_voltage_dict(None, None, "低")
+    package = {"package": "", "package_size": "", "confidence": "低"}
+    temp = build_temperature_dict(None, None, "低")
+
+    if is_table_source:
+        density_text = get_first_non_empty(row, ["density", "capacity", "memory"]) or row_text
+        vcc_text = get_first_non_empty(row, ["vcc", "voltage"])
+        package_text = get_first_non_empty(row, ["package", "pkg"])
+        temp_text = get_first_non_empty(row, ["temperature", "tem", "temp"])
+
+        density_mb, density_display = parse_density_from_text(density_text)
+        # 如果密度列缺失，再从整行找带单位容量，但 parse 函数不会乱取纯数字。
+        if density_mb is None:
+            density_mb, density_display = parse_density_from_text(row_text)
+
+        vmin, vmax = parse_voltage_from_text(vcc_text or row_text)
+        voltage = build_voltage_dict(vmin, vmax, "产品页" if vmin is not None else "低")
+        package = extract_package(package_text) if package_text else {"package": "", "package_size": "", "confidence": "低"}
+        temp = extract_temperature(temp_text) if temp_text else build_temperature_dict(None, None, "低")
 
     return {
         "product_type": product_type.get("product_type", ""),
@@ -693,7 +762,6 @@ def spec_from_product_page_row(row: pd.Series, selected_type: str, model: str) -
         "temp_max": temp.get("temp_max"),
         "temperature_confidence": "产品页" if temp.get("display") else "低",
     }
-
 
 def build_seed_urls(company: str, base_url: str, search_template: str, model: str) -> list[str]:
     """构造少量高价值入口，避免全站漫游拖慢速度。search_url_template 可以是含 {model} 的搜索地址，也可以是固定产品页。"""
@@ -1087,28 +1155,42 @@ def extract_density(text: str) -> dict:
     }
 
 
-def parse_density_from_text(value: str):
-    if not value:
-        return None, ""
-    s = str(value).upper().replace(" ", "")
-    m = re.search(r"(\d+(?:\.\d+)?)(GBIT|G-BIT|GB|G)", s)
-    if m:
-        density = int(float(m.group(1)) * 1024)
-        return density, f"{float(m.group(1)):g}Gb"
-    m = re.search(r"(\d+(?:\.\d+)?)(MBIT|M-BIT|MB|M)", s)
-    if m:
-        density = int(float(m.group(1)))
-        return density, f"{density}Mb"
-    m = re.search(r"(\d+(?:\.\d+)?)(KBIT|K-BIT|KB|K)", s)
-    if m:
-        kb = float(m.group(1))
-        return kb / 1024, f"{kb:g}Kb"
-    m = re.search(r"(\d+(?:\.\d+)?)", s)
-    if m:
-        density = int(float(m.group(1)))
-        return density, f"{density}Mb"
-    return None, ""
 
+def parse_density_from_text(value: str):
+    """解析容量文本，避免把表格行号和容量粘连成错误容量。
+
+    典型输入：512Kb、4Mb、4Mbit、1Gb、8Gbit、32Mbit。
+    不再简单删除所有空格，否则 "7 4Mb" 会被误判成 74Mb。
+    """
+    if value is None or str(value).strip() == "":
+        return None, ""
+    raw = str(value).strip()
+    s = raw.upper().replace("Ｍ", "M").replace("Ｇ", "G").replace("Ｋ", "K")
+    s = s.replace("‐", "-").replace("‑", "-").replace("–", "-").replace("—", "-")
+
+    # 优先匹配有明确单位的容量。要求数字和单位之间最多允许少量空格，不跨越其它数字。
+    patterns = [
+        (r"(?<![A-Z0-9])(\d+(?:\.\d+)?)\s*(G\s*BIT|GBIT|G-BIT|G\b)", 1024, "Gb"),
+        (r"(?<![A-Z0-9])(\d+(?:\.\d+)?)\s*(M\s*BIT|MBIT|M-BIT|M\b|MB\b)", 1, "Mb"),
+        (r"(?<![A-Z0-9])(\d+(?:\.\d+)?)\s*(K\s*BIT|KBIT|K-BIT|K\b|KB\b)", 1/1024, "Kb"),
+    ]
+    for pattern, factor, unit in patterns:
+        m = re.search(pattern, s)
+        if m:
+            num = float(m.group(1))
+            density_mb = num * factor
+            if unit == "Gb":
+                return int(density_mb) if density_mb.is_integer() else density_mb, f"{num:g}Gb"
+            if unit == "Mb":
+                return int(density_mb) if float(density_mb).is_integer() else density_mb, f"{density_mb:g}Mb"
+            return density_mb, f"{num:g}Kb"
+
+    # 没有单位时，仅当整个字符串基本就是一个数字才按 Mb 处理；不要从完整表格行中随便取第一个数字。
+    compact = re.sub(r"\s+", "", s)
+    if re.fullmatch(r"\d+(?:\.\d+)?", compact):
+        density = float(compact)
+        return int(density) if density.is_integer() else density, f"{density:g}Mb"
+    return None, ""
 
 def build_voltage_dict(vmin, vmax, confidence="中") -> dict:
     if vmin is None or vmax is None:
@@ -1166,16 +1248,32 @@ def extract_voltage(text: str) -> dict:
     return build_voltage_dict(best["vcc_min"], best["vcc_max"], "中")
 
 
-def parse_voltage_from_text(value: str):
-    if not value:
-        return None, None
-    s = str(value).replace("–", "-").replace("—", "-").replace("~", "-").replace("～", "-")
-    nums = re.findall(r"\d+\.\d+|\d+", s)
-    nums = [float(x) for x in nums]
-    if len(nums) >= 2:
-        return min(nums[0], nums[1]), max(nums[0], nums[1])
-    return None, None
 
+def parse_voltage_from_text(value: str):
+    """解析电压范围，必须匹配带 V 的范围，避免把表格 ID / 容量 / 型号数字误判为电压。"""
+    if value is None or str(value).strip() == "":
+        return None, None
+    s = str(value).replace("–", "-").replace("—", "-").replace("~", "-").replace("～", "-").replace("至", "-")
+    s = re.sub(r"\s+", "", s)
+
+    # 典型：2.7-3.6V、2.7V-3.6V、Vcc2.7-3.6V
+    patterns = [
+        r"([0-9](?:\.\d{1,3})?)V?-([0-9](?:\.\d{1,3})?)V",
+        r"VCC[:：=]?([0-9](?:\.\d{1,3})?)-([0-9](?:\.\d{1,3})?)V?",
+        r"([0-9](?:\.\d{1,3})?)V(?:TO|-)([0-9](?:\.\d{1,3})?)V",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, s, flags=re.IGNORECASE)
+        if not m:
+            continue
+        v1 = safe_float(m.group(1))
+        v2 = safe_float(m.group(2))
+        if v1 is None or v2 is None:
+            continue
+        vmin, vmax = min(v1, v2), max(v1, v2)
+        if 1.0 <= vmin <= 5.5 and 1.0 <= vmax <= 5.5:
+            return vmin, vmax
+    return None, None
 
 def extract_package(text: str) -> dict:
     t = text.upper().replace("×", "x").replace("X", "x")
@@ -1407,6 +1505,175 @@ def build_confirmed_spec(original_spec: dict, review_df: pd.DataFrame) -> tuple[
     return spec, confirm_map
 
 
+def display_density_from_row(row: pd.Series) -> str:
+    val = row.get("capacity_display", "")
+    if val is not None and str(val).strip() not in ["", "nan", "None"]:
+        return str(val).strip()
+    density = safe_float(row.get("density_mb"))
+    if density is None:
+        return ""
+    if density >= 1024 and abs(density / 1024 - round(density / 1024)) < 1e-9:
+        return f"{density / 1024:g}Gb"
+    return f"{density:g}Mb"
+
+
+def display_voltage_from_row(row: pd.Series) -> str:
+    val = row.get("voltage_range", "")
+    if val is not None and str(val).strip() not in ["", "nan", "None"]:
+        return str(val).strip().replace("~", "~")
+    vmin = safe_float(row.get("vcc_min"))
+    vmax = safe_float(row.get("vcc_max"))
+    if vmin is None or vmax is None:
+        return ""
+    return f"{vmin:g}~{vmax:g}V"
+
+
+def display_temperature_from_row(row: pd.Series) -> str:
+    val = row.get("temperature", "")
+    if val is not None and str(val).strip() not in ["", "nan", "None"]:
+        return str(val).strip()
+    tmin = safe_float(row.get("temp_min"))
+    tmax = safe_float(row.get("temp_max"))
+    if tmin is None or tmax is None:
+        return ""
+    return f"{int(tmin)}°C~{int(tmax)}°C"
+
+
+def unique_non_empty(values) -> list[str]:
+    out = []
+    seen = set()
+    for v in values:
+        if v is None:
+            continue
+        sv = str(v).strip()
+        if sv in ["", "nan", "None"]:
+            continue
+        key = normalize_model(sv)
+        if key not in seen:
+            out.append(sv)
+            seen.add(key)
+    return out
+
+
+def build_selection_options(xtx_df: pd.DataFrame) -> dict[str, list[str]]:
+    df = xtx_df.copy() if not xtx_df.empty else DEFAULT_XTX_PRODUCT_LIBRARY.copy()
+    product_types = unique_non_empty([normalize_product_type(v) for v in df.get("product_type", pd.Series(dtype=str)).tolist()])
+    product_types = unique_non_empty(product_types + [v for v in PRODUCT_TYPE_OPTIONS if v != "未指定"])
+    capacities = unique_non_empty([display_density_from_row(row) for _, row in df.iterrows()])
+    voltages = unique_non_empty([display_voltage_from_row(row) for _, row in df.iterrows()])
+    packages = unique_non_empty(df.get("package", pd.Series(dtype=str)).tolist())
+    package_sizes = unique_non_empty(df.get("package_size", pd.Series(dtype=str)).tolist())
+    temperatures = unique_non_empty([display_temperature_from_row(row) for _, row in df.iterrows()])
+    return {
+        "product_type": [""] + product_types,
+        "capacity": [""] + capacities,
+        "voltage": [""] + voltages,
+        "package": [""] + packages,
+        "package_size": [""] + package_sizes,
+        "temperature": [""] + temperatures,
+    }
+
+
+def find_option_index(options: list[str], value: str, kind: str = "text") -> int:
+    if not options:
+        return 0
+    if value is None or str(value).strip() == "":
+        return 0
+    val = str(value).strip()
+    if kind == "capacity":
+        d0, _ = parse_density_from_text(val)
+        for i, opt in enumerate(options):
+            d1, _ = parse_density_from_text(opt)
+            if d0 is not None and d1 is not None and abs(float(d0) - float(d1)) <= 0.001:
+                return i
+    elif kind == "voltage":
+        v0 = parse_voltage_from_text(val)
+        for i, opt in enumerate(options):
+            v1 = parse_voltage_from_text(opt)
+            if v0[0] is not None and v1[0] is not None and values_match(v0[0], v1[0]) and values_match(v0[1], v1[1]):
+                return i
+    elif kind == "temperature":
+        t0 = parse_temperature_from_text(val)
+        for i, opt in enumerate(options):
+            t1 = parse_temperature_from_text(opt)
+            if t0[0] is not None and t1[0] is not None and int(t0[0]) == int(t1[0]) and int(t0[1]) == int(t1[1]):
+                return i
+    else:
+        key0 = normalize_product_type(val) if kind == "product_type" else normalize_model(val)
+        for i, opt in enumerate(options):
+            key1 = normalize_product_type(opt) if kind == "product_type" else normalize_model(opt)
+            if key0 and key0 == key1:
+                return i
+    return 0
+
+
+def build_spec_from_selection(original_spec: dict, selection: dict) -> tuple[dict, dict]:
+    """用下拉选型结果覆盖自动解析结果，作为推荐输入。"""
+    spec = original_spec.copy()
+    confirm_map = {}
+
+    pt = normalize_product_type(selection.get("product_type", ""))
+    if pt:
+        spec["product_type"] = pt
+        spec["product_type_confidence"] = "选型确认"
+        confirm_map["product_type"] = "已确认"
+    else:
+        confirm_map["product_type"] = "未确认"
+
+    cap = selection.get("capacity", "")
+    density_mb, display = parse_density_from_text(cap)
+    if density_mb is not None:
+        spec["density_mb"] = density_mb
+        spec["capacity"] = display or cap
+        spec["capacity_confidence"] = "选型确认"
+        confirm_map["capacity"] = "已确认"
+    else:
+        confirm_map["capacity"] = "未确认"
+
+    voltage = selection.get("voltage", "")
+    vmin, vmax = parse_voltage_from_text(voltage)
+    if vmin is not None and vmax is not None:
+        vd = build_voltage_dict(vmin, vmax, "选型确认")
+        spec.update({
+            "vcc_min": vd["vcc_min"], "vcc_max": vd["vcc_max"],
+            "voltage_range": vd["display"], "voltage_type": vd["voltage_type"],
+            "voltage_confidence": vd["confidence"],
+        })
+        confirm_map["voltage"] = "已确认"
+    else:
+        confirm_map["voltage"] = "未确认"
+
+    pkg = str(selection.get("package", "") or "").strip()
+    if pkg:
+        spec["package"] = pkg
+        spec["package_confidence"] = "选型确认"
+        confirm_map["package"] = "已确认"
+    else:
+        confirm_map["package"] = "未确认"
+
+    pkg_size = str(selection.get("package_size", "") or "").strip()
+    if pkg_size:
+        spec["package_size"] = pkg_size
+        spec["package_confidence"] = "选型确认"
+        confirm_map["package_size"] = "已确认"
+    else:
+        confirm_map["package_size"] = "未确认"
+
+    temp = selection.get("temperature", "")
+    tmin, tmax = parse_temperature_from_text(temp)
+    if tmin is not None and tmax is not None:
+        td = build_temperature_dict(tmin, tmax, "选型确认")
+        spec.update({
+            "temp_min": td["temp_min"], "temp_max": td["temp_max"],
+            "temperature": td["display"], "temp_grade": td["temp_grade"],
+            "temperature_confidence": td["confidence"],
+        })
+        confirm_map["temperature"] = "已确认"
+    else:
+        confirm_map["temperature"] = "未确认"
+    return spec, confirm_map
+
+
 # =========================================================
 # 匹配权重与 XTX 推荐逻辑
 # =========================================================
@@ -1426,53 +1693,65 @@ def get_enabled_weights(weights_df: pd.DataFrame) -> dict[str, float]:
     return weights or {"product_type": 20, "density": 35, "voltage": 30, "package": 10, "temperature": 10}
 
 
+
 def core_match_filter(spec: dict, xtx_df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
-    """V2 核心规则：产品类型 + 容量 + 电压必须一致，才允许推荐。"""
+    """V5 核心推荐规则：只要求 产品类型 + 容量 一致。
+
+    电压范围、封装、封装尺寸、温度范围不再作为进入推荐列表的硬条件，
+    而是在后续评分和风险点中体现，避免因为竞品电压识别错误导致没有推荐结果。
+    """
     warnings = []
     if xtx_df.empty:
         return pd.DataFrame(), ["XTX 产品库为空。"]
 
     spec_pt = normalize_product_type(spec.get("product_type", ""))
     spec_density = spec.get("density_mb")
-    spec_vmin = spec.get("vcc_min")
-    spec_vmax = spec.get("vcc_max")
 
     missing = []
     if not spec_pt:
         missing.append("产品类型")
     if spec_density is None or spec_density == "":
         missing.append("容量")
-    if spec_vmin is None or spec_vmax is None:
-        missing.append("电压范围")
     if missing:
-        return pd.DataFrame(), [f"核心字段缺失：{'、'.join(missing)}。请在人工确认区补充后再推荐。"]
+        return pd.DataFrame(), [f"核心字段缺失：{'、'.join(missing)}。请在选型确认区补充后再推荐。"]
 
     df = xtx_df.copy()
     df["_norm_product_type"] = df["product_type"].apply(normalize_product_type)
     df["_density_mb"] = df["density_mb"].apply(safe_float)
-    df["_vcc_min"] = df["vcc_min"].apply(safe_float)
-    df["_vcc_max"] = df["vcc_max"].apply(safe_float)
 
     mask = (
         df["_norm_product_type"].eq(spec_pt)
         & df["_density_mb"].apply(lambda x: x is not None and abs(float(x) - float(spec_density)) <= 0.001)
-        & df["_vcc_min"].apply(lambda x: values_match(x, spec_vmin))
-        & df["_vcc_max"].apply(lambda x: values_match(x, spec_vmax))
     )
-    matched = df[mask].drop(columns=["_norm_product_type", "_density_mb", "_vcc_min", "_vcc_max"], errors="ignore")
+    matched = df[mask].drop(columns=["_norm_product_type", "_density_mb"], errors="ignore")
     if matched.empty:
-        warnings.append(
-            f"没有找到满足核心条件的 XTX 型号：产品类型={spec_pt}，容量={spec_density}Mb，电压={spec_vmin:g}V–{spec_vmax:g}V。"
-        )
+        warnings.append(f"没有找到满足核心条件的 XTX 型号：产品类型={spec_pt}，容量={spec_density}Mb。")
     return matched, warnings
 
 
 def calc_secondary_score(spec: dict, xtx_row: pd.Series, weights: dict[str, float]) -> tuple[float, float, str, list[str]]:
-    # 核心三项已过滤，这里只做完整度评分和风险提示
-    core_score = weights.get("product_type", 20) + weights.get("density", 35) + weights.get("voltage", 30)
+    # 产品类型 + 容量已经过滤，这里只做电压/封装/温度的排序评分和风险提示。
+    core_score = weights.get("product_type", 20) + weights.get("density", 35)
     score = float(core_score)
     max_score = float(sum(weights.values())) if weights else 100.0
     risks = []
+
+    spec_vmin = spec.get("vcc_min")
+    spec_vmax = spec.get("vcc_max")
+    xtx_vmin = safe_float(xtx_row.get("vcc_min"))
+    xtx_vmax = safe_float(xtx_row.get("vcc_max"))
+
+    if weights.get("voltage", 0) > 0:
+        if spec_vmin is not None and spec_vmax is not None and xtx_vmin is not None and xtx_vmax is not None:
+            if values_match(xtx_vmin, spec_vmin) and values_match(xtx_vmax, spec_vmax):
+                score += weights["voltage"]
+            elif xtx_vmin <= spec_vmin and xtx_vmax >= spec_vmax:
+                score += weights["voltage"] * 0.7
+                risks.append("XTX 电压范围覆盖竞品，但需确认系统电压")
+            else:
+                risks.append("电压范围不一致，需确认是否可替代")
+        else:
+            risks.append("电压范围未选择/未识别，需人工确认")
 
     competitor_pkg = str(spec.get("package", "")).upper()
     competitor_pkg_size = str(spec.get("package_size", "")).upper()
@@ -1501,7 +1780,7 @@ def calc_secondary_score(spec: dict, xtx_row: pd.Series, weights: dict[str, floa
                 else:
                     risks.append("封装可能不兼容")
         else:
-            risks.append("封装未识别，需人工确认")
+            risks.append("封装未选择/未识别，需人工确认")
 
     if weights.get("temperature", 0) > 0:
         if competitor_tmin is not None and competitor_tmax is not None and xtx_tmin is not None and xtx_tmax is not None:
@@ -1513,7 +1792,7 @@ def calc_secondary_score(spec: dict, xtx_row: pd.Series, weights: dict[str, floa
             else:
                 risks.append("温度等级不满足")
         else:
-            risks.append("温度未识别，需人工确认")
+            risks.append("温度范围未选择/未识别，需人工确认")
 
     match_percent = score / max_score if max_score else 0
     if match_percent >= 0.85:
@@ -1523,7 +1802,6 @@ def calc_secondary_score(spec: dict, xtx_row: pd.Series, weights: dict[str, floa
     else:
         level = "低"
     return round(score, 2), round(match_percent * 100, 1), level, risks
-
 
 def recommend_xtx(spec: dict, xtx_df: pd.DataFrame, weights_df: pd.DataFrame, top_n: int = 8) -> tuple[pd.DataFrame, list[str]]:
     if xtx_df.empty:
@@ -1581,8 +1859,8 @@ def recommend_xtx(spec: dict, xtx_df: pd.DataFrame, weights_df: pd.DataFrame, to
 # 页面 UI
 # =========================================================
 
-st.title("🔎 竞品规格书解析与 XTX 对标推荐工具 V4")
-st.caption("V4：产品页优先匹配；无 PDF 时直接解析官网产品表格；PDF 只校验少量高分候选，显著提升检索速度。")
+st.title("🔎 竞品规格书解析与 XTX 对标推荐工具 V5")
+st.caption("V5：产品页表格精准抽取；选型确认改为下拉选择；推荐规则改为产品类型+容量一致即可推荐，电压/封装/温度作为筛选参考和风险提示。")
 
 with st.sidebar:
     st.header("维护数据上传")
@@ -1850,29 +2128,76 @@ if "last_result" in st.session_state:
             st.dataframe(candidate_df, use_container_width=True)
 
     st.divider()
-    st.subheader("4. 人工确认 / 修正")
-    st.caption("人工修改后，下方 XTX 对标型号推荐会自动刷新。核心字段：产品类型、容量、电压范围必须准确。")
+    st.subheader("4. 选型确认 / 修正")
+    st.caption("自动解析结果仅作为参考。请用下拉框选择最终用于推荐的规格；选项来自 XTX_Product_Library。修改后下方推荐会自动刷新。")
 
-    review_df = st.data_editor(
-        result["review_df"],
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "manual_value": st.column_config.TextColumn(
-                "manual_value",
-                help="例如：产品类型填 SPI NOR；容量填 512Mb；电压填 2.7V-3.6V；温度填 -40~85。",
-            ),
-            "confirm_status": st.column_config.SelectboxColumn(
-                "confirm_status",
-                options=["未确认", "已确认", "需FAE确认", "不适用"],
-                required=True,
-            ),
-        },
-        disabled=["field_key", "field_name", "extracted_value", "confidence"],
-        key="review_editor_v2",
-    )
+    extracted_df = spec_to_review_df(spec)[["field_name", "extracted_value", "confidence"]]
+    with st.expander("查看自动解析字段", expanded=False):
+        st.dataframe(extracted_df, use_container_width=True, hide_index=True)
 
-    confirmed_spec, confirm_map = build_confirmed_spec(spec, review_df)
+    options = build_selection_options(xtx_df)
+
+    csel1, csel2, csel3 = st.columns(3)
+    with csel1:
+        sel_product_type = st.selectbox(
+            "产品类型",
+            options["product_type"],
+            index=find_option_index(options["product_type"], spec.get("product_type", ""), "product_type"),
+            key="sel_product_type_v5",
+            help="选项来自 XTX_Product_Library.product_type。",
+        )
+    with csel2:
+        sel_capacity = st.selectbox(
+            "容量",
+            options["capacity"],
+            index=find_option_index(options["capacity"], spec.get("capacity", ""), "capacity"),
+            key="sel_capacity_v5",
+            help="选项来自 XTX_Product_Library.capacity_display；若没有则由 density_mb 生成。",
+        )
+    with csel3:
+        sel_voltage = st.selectbox(
+            "电压范围",
+            options["voltage"],
+            index=find_option_index(options["voltage"], spec.get("voltage_range", ""), "voltage"),
+            key="sel_voltage_v5",
+            help="选项由 XTX_Product_Library.vcc_min 和 vcc_max 合并生成。电压不再作为推荐硬条件，仅作为排序和风险提示。",
+        )
+
+    csel4, csel5, csel6 = st.columns(3)
+    with csel4:
+        sel_package = st.selectbox(
+            "封装形式",
+            options["package"],
+            index=find_option_index(options["package"], spec.get("package", ""), "text"),
+            key="sel_package_v5",
+            help="选项来自 XTX_Product_Library.package。",
+        )
+    with csel5:
+        sel_package_size = st.selectbox(
+            "封装尺寸",
+            options["package_size"],
+            index=find_option_index(options["package_size"], spec.get("package_size", ""), "text"),
+            key="sel_package_size_v5",
+            help="选项来自 XTX_Product_Library.package_size。",
+        )
+    with csel6:
+        sel_temperature = st.selectbox(
+            "温度范围",
+            options["temperature"],
+            index=find_option_index(options["temperature"], spec.get("temperature", ""), "temperature"),
+            key="sel_temperature_v5",
+            help="选项来自 XTX_Product_Library.temperature；若没有则由 temp_min/temp_max 生成。",
+        )
+
+    selection = {
+        "product_type": sel_product_type,
+        "capacity": sel_capacity,
+        "voltage": sel_voltage,
+        "package": sel_package,
+        "package_size": sel_package_size,
+        "temperature": sel_temperature,
+    }
+    confirmed_spec, confirm_map = build_spec_from_selection(spec, selection)
 
     with st.expander("查看用于推荐的最终规格", expanded=False):
         st.json({
@@ -1889,13 +2214,13 @@ if "last_result" in st.session_state:
 
     st.divider()
     st.subheader("5. XTX 对标型号推荐")
-    st.caption("V3 推荐规则：只有产品类型、容量、电压范围三项核心条件全部一致，才会进入推荐列表；不再把 SPI NAND 或其他容量/电压型号混入推荐。")
+    st.caption("V5 推荐规则：只有产品类型、容量两项核心条件一致，才会进入推荐列表；电压、封装、温度用于排序和风险提示。")
     recommend_df, rec_warnings = recommend_xtx(confirmed_spec, xtx_df, weights_df, top_n=10)
     for w in rec_warnings:
         st.warning(w)
 
     if recommend_df.empty:
-        st.info("当前没有满足核心条件的 XTX 对标型号。请检查：产品类型、容量、电压范围是否识别/填写正确，或补充 XTX 产品库。")
+        st.info("当前没有满足核心条件的 XTX 对标型号。请检查：产品类型、容量是否选择正确，或补充 XTX 产品库。")
     else:
         st.dataframe(recommend_df, use_container_width=True, height=360)
         best = recommend_df.iloc[0]
