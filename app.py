@@ -20,6 +20,8 @@ import io
 import os
 import re
 import json
+import sys
+import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from urllib.parse import quote_plus, urljoin, urlparse
@@ -37,7 +39,7 @@ from rapidfuzz import fuzz
 # =========================================================
 
 st.set_page_config(
-    page_title="竞品规格书解析与 XTX 对标推荐工具 V8",
+    page_title="竞品规格书解析与 XTX 对标推荐工具 V9",
     page_icon="🔎",
     layout="wide",
 )
@@ -412,6 +414,107 @@ def request_url(url: str):
     return CachedResponse(cached_get_url(url))
 
 
+
+# =========================================================
+# 可选：Playwright 动态页面渲染
+# =========================================================
+
+def playwright_available() -> tuple[bool, str]:
+    try:
+        import playwright.sync_api  # noqa: F401
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+
+def render_page_with_playwright(url: str, model: str = "", timeout_ms: int = 12000) -> tuple[str, str, str]:
+    """使用 Playwright 渲染动态页面，并尽量在页面搜索框中输入型号。
+
+    返回：html, final_url, message。
+    如果 Playwright 没安装、浏览器没安装或渲染失败，返回空 html 和错误信息。
+    """
+    try:
+        from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+    except Exception as e:
+        return "", url, f"Playwright 未安装或不可用：{e}"
+
+    browser = None
+    try:
+        with sync_playwright() as pw:
+            try:
+                browser = pw.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+            except Exception as launch_error:
+                # Streamlit Cloud 首次部署时可能只有 Python 包，没有 Chromium 浏览器文件。
+                # 尝试自动安装一次；失败则走普通 requests/PDF库兜底。
+                if "Executable" in str(launch_error) or "playwright install" in str(launch_error):
+                    try:
+                        subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=False, timeout=120)
+                        browser = pw.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+                    except Exception:
+                        raise launch_error
+                else:
+                    raise
+            page = browser.new_page(user_agent=HEADERS.get("User-Agent", "Mozilla/5.0"))
+            page.set_default_timeout(timeout_ms)
+            page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            try:
+                page.wait_for_load_state("networkidle", timeout=min(timeout_ms, 8000))
+            except Exception:
+                pass
+
+            # 尝试使用站内产品搜索框。不同官网 input 名称不同，所以用一组宽松选择器。
+            if model:
+                search_selectors = [
+                    "input[type=search]", "input[placeholder*=Search]", "input[placeholder*=搜索]",
+                    "input[placeholder*=keyword i]", "input[placeholder*=part i]", "input[placeholder*=Part i]",
+                    "input[name*=search i]", "input[id*=search i]", "input[class*=search i]",
+                    "input[type=text]",
+                ]
+                filled = False
+                for sel in search_selectors:
+                    try:
+                        loc = page.locator(sel)
+                        if loc.count() > 0 and loc.first.is_visible():
+                            loc.first.fill(model)
+                            try:
+                                loc.first.press("Enter")
+                            except Exception:
+                                pass
+                            filled = True
+                            break
+                    except Exception:
+                        continue
+                if filled:
+                    # 有些网站需要点击搜索图标/按钮。
+                    for sel in ["button:has-text('查询')", "button:has-text('Search')", "button:has-text('搜索')", ".search button", "button[type=submit]"]:
+                        try:
+                            loc = page.locator(sel)
+                            if loc.count() > 0 and loc.first.is_visible():
+                                loc.first.click(timeout=1500)
+                                break
+                        except Exception:
+                            continue
+                    try:
+                        page.wait_for_timeout(1800)
+                    except Exception:
+                        pass
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=5000)
+                    except Exception:
+                        pass
+
+            html = page.content()
+            final_url = page.url
+            browser.close()
+            return html, final_url, "Playwright 渲染成功"
+    except Exception as e:
+        try:
+            if browser:
+                browser.close()
+        except Exception:
+            pass
+        return "", url, f"Playwright 渲染失败：{e}"
+
 def values_match(a, b, tol=0.15) -> bool:
     if a is None or b is None:
         return False
@@ -761,18 +864,42 @@ def product_type_from_url_or_text(url: str, text: str, selected_type: str, model
     return extract_product_type(text, selected_type=selected_type, model=model).get("product_type", "")
 
 
+def text_window_near_model(text: str, model: str, window_lines: int = 8) -> str:
+    """取型号附近的若干行，优先用于动态产品列表详情页抽取，避免抽到筛选器/菜单。"""
+    model_norm = normalize_model(model)
+    lines = [x.strip() for x in str(text).splitlines() if x.strip()]
+    hit_indexes = [i for i, line in enumerate(lines) if model_norm and model_norm in normalize_model(line)]
+    chunks = []
+    for idx in hit_indexes[:5]:
+        s = max(0, idx - window_lines)
+        e = min(len(lines), idx + window_lines + 1)
+        chunks.extend(lines[s:e])
+    return "\n".join(dict.fromkeys(chunks))
+
+
 def product_detail_row_from_page(html: str, current_url: str, model: str, company: str, selected_type: str = "未指定") -> dict | None:
-    """从官网产品详情页抽取结构化字段。优先用于 GigaDevice 等没有传统 HTML 表格、但页面文本包含 Features 字段的网站。"""
+    """从官网产品详情页/动态渲染后的产品结果页抽取结构化字段。
+
+    V9 优化：
+    1. 只接受明确电压 token，避免把 Current Monitor 等 Feature 字段误判成电压。
+    2. 温度支持多个范围，并优先从型号附近文本抽取。
+    3. 如果页面是产品列表但不是标准 table，也从型号附近行抽取字段。
+    """
     model_norm = normalize_model(model)
     soup = BeautifulSoup(html, "html.parser")
     page_text = soup.get_text("\n", strip=True)
     text_norm = normalize_model(page_text)
     if model_norm not in text_norm:
         return None
+
     lines = [x.strip() for x in page_text.splitlines() if x.strip()]
+    focus = text_window_near_model(page_text, model, window_lines=14)
+    focus_flat = re.sub(r"\s+", " ", focus)
+    flat = re.sub(r"\s+", " ", page_text)
 
     part_no = ""
-    for line in lines[:80]:
+    for line in lines[:300]:
+        # 允许用户输入主体型号，页面实际型号多一个后缀，如 GD25LE256 -> GD25LE256H。
         m = re.search(rf"\b({re.escape(str(model).upper())}[A-Z0-9]*)\b", line.upper())
         if m:
             part_no = m.group(1)
@@ -780,25 +907,41 @@ def product_detail_row_from_page(html: str, current_url: str, model: str, compan
     if not part_no:
         part_no = model
 
-    stop_labels = [r"Status", r"Voltage", r"Density", r"Temperature", r"I/O Bus", r"Frequency", r"Features", r"Packages", r"Documentation", r"Development Tools"]
+    stop_labels = [r"Status", r"Voltage", r"Density", r"Temperature", r"Temp", r"I/O Bus", r"Frequency", r"Features", r"Packages", r"Package", r"Documentation", r"Development Tools", r"Datasheet", r"Part No"]
     status = line_value_after(lines, [r"Status"], stop_labels)
-    voltage = line_value_after(lines, [r"Voltage"], stop_labels)
-    density = line_value_after(lines, [r"Density"], stop_labels)
-    temperature = line_value_after(lines, [r"Temperature.*"], stop_labels)
-    frequency = line_value_after(lines, [r"Frequency.*"], stop_labels)
-    feature = line_value_after(lines, [r"Features"], stop_labels)
-    package = line_value_after(lines, [r"Packages"], stop_labels)
+    density = line_value_after(lines, [r"Density", r"Capacity", r"容量"], stop_labels)
+    voltage = line_value_after(lines, [r"Voltage", r"VCC", r"电压"], stop_labels)
+    temperature = line_value_after(lines, [r"Temperature.*", r"Temp.*", r"温度.*"], stop_labels)
+    frequency = line_value_after(lines, [r"Frequency.*", r"Freq.*", r"频率.*"], stop_labels)
+    feature = line_value_after(lines, [r"Features", r"主要特性", r"Feature"], stop_labels)
+    package = line_value_after(lines, [r"Packages", r"Package", r"PKG", r"主要封装", r"封装"], stop_labels)
 
-    # 如果标签提取失败，再用正则兜底。
-    flat = re.sub(r"\s+", " ", page_text)
+    # 兜底：型号附近文本通常包含完整产品行，优先从这里提取。
+    if not density:
+        m = re.search(r"(?<![A-Z0-9])(\d+(?:\.\d+)?)\s*(?:Kbit|Kb|Mbit|Mb|Gbit|Gb)\b", focus_flat, flags=re.IGNORECASE)
+        density = m.group(0) if m else ""
+    if not voltage or not extract_voltage_tokens_from_text(voltage):
+        tokens = extract_voltage_tokens_from_text(focus_flat)
+        voltage = " / ".join(tokens) if tokens else ""
+    if not temperature:
+        temp_obj = extract_all_temperature_ranges(focus_flat)
+        temperature = temp_obj.get("display", "")
+    if not package:
+        pkg_obj = extract_package(focus_flat)
+        package = " ".join([pkg_obj.get("package", ""), pkg_obj.get("package_size", "")]).strip()
+
+    # 最后从全文兜底，但仍只接受明确字段，不使用无关 Feature 文本。
     if not density:
         m = re.search(r"Density\s+([0-9]+\s*(?:Kb|Mb|Gb|Kbit|Mbit|Gbit))", flat, flags=re.IGNORECASE)
         density = m.group(1) if m else ""
     if not voltage:
-        m = re.search(r"Voltage\s+([0-9.]+\s*V?\s*[~\-–]\s*[0-9.]+\s*V)", flat, flags=re.IGNORECASE)
-        voltage = m.group(1) if m else ""
+        tokens = extract_voltage_tokens_from_text(flat)
+        voltage = " / ".join(tokens[:3]) if tokens else ""
+    if not temperature:
+        temp_obj = extract_all_temperature_ranges(flat)
+        temperature = temp_obj.get("display", "")
     if not package:
-        m = re.search(r"Packages\s+(.+?)(?:Documentation|Development Tools|Datasheet|Buy now|$)", flat, flags=re.IGNORECASE)
+        m = re.search(r"Packages?\s+(.+?)(?:Documentation|Development Tools|Datasheet|Buy now|$)", flat, flags=re.IGNORECASE)
         package = m.group(1).strip() if m else ""
 
     if not any([density, voltage, temperature, frequency, feature, package]):
@@ -817,12 +960,40 @@ def product_detail_row_from_page(html: str, current_url: str, model: str, compan
         "source_url": current_url,
         "page_url": current_url,
         "row_text": row_text,
-        "source_kind": "官网产品详情页",
+        "source_kind": "官网产品详情页/动态页面",
         "page_score": 650 + score_pdf_candidate(current_url, row_text, model),
     }
 
-def crawl_company_for_product_page(company_row: pd.Series, model: str, max_pages: int = 3) -> pd.DataFrame:
-    """V8：只检索官网产品中心/产品详情页，不再在自动模式下下载或扫描 PDF。"""
+def extract_rows_from_html_for_model(html: str, final_url: str, domain: str, company: str, model: str) -> tuple[list[dict], bool, str, str]:
+    """统一从 HTML 中抽取目标型号行。返回 rows, page_has_model, page_text, best_pdf。"""
+    model_norm = normalize_model(model)
+    page_text = BeautifulSoup(html, "html.parser").get_text(" ", strip=True)
+    page_has_model = model_norm in normalize_model(page_text)
+    pdfs = extract_pdf_links_from_page(html, final_url, domain, model)
+    best_pdf = pdfs[0]["url"] if pdfs else ""
+    current_page_rows = []
+
+    for row in table_rows_containing_model(html, model, final_url):
+        row.update({
+            "company_name": company,
+            "page_url": final_url,
+            "datasheet_url": best_pdf,
+            "source_kind": "官网产品页表格",
+            "page_score": 500 + score_pdf_candidate(final_url, row.get("row_text", ""), model),
+        })
+        current_page_rows.append(row)
+
+    if page_has_model and not current_page_rows:
+        detail_row = product_detail_row_from_page(html, final_url, model, company)
+        if detail_row:
+            detail_row.update({"company_name": company, "datasheet_url": best_pdf})
+            current_page_rows.append(detail_row)
+
+    return current_page_rows, page_has_model, page_text, best_pdf
+
+
+def crawl_company_for_product_page(company_row: pd.Series, model: str, max_pages: int = 3, use_playwright: bool = False, max_seconds: int = 45) -> pd.DataFrame:
+    """V9：优先检索官网产品中心/详情页；未命中且启用时自动尝试 Playwright 渲染动态页面。"""
     company = str(company_row.get("company_name", "")).strip()
     domain = str(company_row.get("domain", "")).strip()
     base_url = str(company_row.get("base_url", "")).strip()
@@ -830,12 +1001,15 @@ def crawl_company_for_product_page(company_row: pd.Series, model: str, max_pages
     if not domain or not base_url:
         return pd.DataFrame()
 
+    started = datetime.now().timestamp()
     visited = set()
     queue = build_seed_urls(company, base_url, search_template, model)
     results = []
     model_norm = normalize_model(model)
 
     while queue and len(visited) < max_pages:
+        if datetime.now().timestamp() - started > max_seconds:
+            break
         current_url = queue.pop(0)
         if current_url in visited:
             continue
@@ -844,6 +1018,16 @@ def crawl_company_for_product_page(company_row: pd.Series, model: str, max_pages
             resp = request_url(current_url)
             resp.raise_for_status()
         except Exception:
+            # requests 失败且启用动态渲染时，仍尝试 Playwright 一次。
+            if use_playwright:
+                html_pw, final_url_pw, msg = render_page_with_playwright(current_url, model=model)
+                if html_pw:
+                    rows, page_has_model, page_text, best_pdf = extract_rows_from_html_for_model(html_pw, final_url_pw, domain, company, model)
+                    if rows:
+                        for r in rows:
+                            r["render_mode"] = "Playwright"
+                        results.extend(rows)
+                        continue
             continue
         final_url = resp.url
         if not same_domain_or_subdomain(final_url, domain):
@@ -853,40 +1037,27 @@ def crawl_company_for_product_page(company_row: pd.Series, model: str, max_pages
             continue
 
         html = resp.text
-        page_text = BeautifulSoup(html, "html.parser").get_text(" ", strip=True)
-        page_has_model = model_norm in normalize_model(page_text)
-        pdfs = extract_pdf_links_from_page(html, final_url, domain, model)
-        best_pdf = pdfs[0]["url"] if pdfs else ""
+        rows, page_has_model, page_text, best_pdf = extract_rows_from_html_for_model(html, final_url, domain, company, model)
 
-        current_page_rows = []
+        # 动态加载页面：requests 结果未命中或字段明显缺失时，尝试 Playwright 渲染。
+        need_dynamic = use_playwright and (not rows or not page_has_model)
+        if need_dynamic:
+            html_pw, final_url_pw, msg = render_page_with_playwright(final_url, model=model)
+            if html_pw and same_domain_or_subdomain(final_url_pw, domain):
+                rows_pw, page_has_model_pw, page_text_pw, best_pdf_pw = extract_rows_from_html_for_model(html_pw, final_url_pw, domain, company, model)
+                if rows_pw:
+                    for r in rows_pw:
+                        r["render_mode"] = "Playwright"
+                    rows = rows_pw
+                    page_has_model = page_has_model_pw
+                    page_text = page_text_pw
+                    best_pdf = best_pdf_pw
 
-        # 1) 标准产品选择器表格：例如 Boya 的产品列表。
-        for row in table_rows_containing_model(html, model, final_url):
-            row.update({
-                "company_name": company,
-                "page_url": final_url,
-                "datasheet_url": best_pdf,
-                "source_kind": "官网产品页表格",
-                "page_score": 500 + score_pdf_candidate(final_url, row.get("row_text", ""), model),
-            })
-            current_page_rows.append(row)
-
-        # 2) 产品详情页标签字段：例如 GigaDevice 的 GD25LE256H 详情页。
-        if page_has_model and not current_page_rows:
-            detail_row = product_detail_row_from_page(html, final_url, model, company)
-            if detail_row:
-                detail_row.update({
-                    "company_name": company,
-                    "datasheet_url": best_pdf,
-                })
-                current_page_rows.append(detail_row)
-
-        if current_page_rows:
-            results.extend(current_page_rows)
-            # 已经命中产品中心/详情页，不继续深爬，避免慢。
+        if rows:
+            results.extend(rows)
             continue
 
-        # 3) 页面文本包含型号，但没有结构化字段：只保留来源，不做字段误抽取。
+        # 页面文本包含型号但没有结构化字段：只保留来源，不做字段误抽取。
         if page_has_model:
             results.append({
                 "company_name": company,
@@ -899,7 +1070,6 @@ def crawl_company_for_product_page(company_row: pd.Series, model: str, max_pages
             })
             continue
 
-        # 4) 没命中时，只继续少量高相关产品中心链接；不进入 PDF 下载。
         links = extract_links_from_html(html, final_url)
         for item in links:
             link_url = item["url"]
@@ -908,7 +1078,7 @@ def crawl_company_for_product_page(company_row: pd.Series, model: str, max_pages
                 continue
             link_url_l = link_url.lower()
             combined = normalize_model(link_url + " " + link_text)
-            if model_norm in combined or any(k in link_url_l for k in ["product", "products", "flash", "nor", "nand", "spi"]):
+            if model_norm in combined or any(k in link_url_l for k in ["product", "products", "flash", "nor", "nand", "spi", "search"]):
                 if link_url not in visited and len(queue) < max_pages * 3:
                     queue.append(link_url)
 
@@ -917,13 +1087,17 @@ def crawl_company_for_product_page(company_row: pd.Series, model: str, max_pages
     df = pd.DataFrame(results).sort_values("page_score", ascending=False).drop_duplicates(subset=["page_url", "row_text"])
     return df
 
-def crawl_product_pages_parallel(search_df: pd.DataFrame, model: str, max_pages: int) -> pd.DataFrame:
+def crawl_product_pages_parallel(search_df: pd.DataFrame, model: str, max_pages: int, use_playwright: bool = False, max_seconds: int = 45) -> pd.DataFrame:
     if search_df.empty:
         return pd.DataFrame()
     dfs = []
-    max_workers = min(4, max(1, len(search_df)))
+    # Playwright 浏览器渲染不适合多线程并发；启用时串行更稳定。
+    max_workers = 1 if use_playwright else min(4, max(1, len(search_df)))
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(crawl_company_for_product_page, row, model, max_pages): row.get("company_name", "") for _, row in search_df.iterrows()}
+        futures = {
+            executor.submit(crawl_company_for_product_page, row, model, max_pages, use_playwright, max_seconds): row.get("company_name", "")
+            for _, row in search_df.iterrows()
+        }
         for future in as_completed(futures):
             try:
                 df = future.result()
@@ -1791,27 +1965,86 @@ def normalize_display_text(value) -> str:
     return s.replace("℃", "°C").replace("～", "~").replace("–", "-").replace("—", "-")
 
 
+def extract_voltage_tokens_from_text(value: str) -> list[str]:
+    """从产品页表格/详情页文本中提取可信电压字段。
+
+    只保留明确像电压的 token，避免把 Current Monitor、Feature 文本误判成电压。
+    支持：1.8V、3V、3.3V、WV、1.8V/3.3V、2.7~3.6V 等。
+    """
+    raw = normalize_display_text(value)
+    if not raw:
+        return []
+    text = raw.replace("–", "-").replace("—", "-").replace("～", "~")
+    tokens: list[str] = []
+
+    # 1.8V/3.3V、1.8V / 3.3V
+    for m in re.finditer(r"\b(?:1\.8|1\.65|1\.7|1\.75|1\.95|2\.5|2\.7|3|3\.0|3\.3)\s*V\s*/\s*(?:1\.8|2\.7|3|3\.0|3\.3)\s*V\b", text, flags=re.IGNORECASE):
+        tokens.append(re.sub(r"\s+", "", m.group(0)))
+
+    # 2.7~3.6V / 2.7V-3.6V / 1.65-1.95V
+    range_patterns = [
+        r"\b([0-9](?:\.\d{1,3})?)\s*V?\s*(?:~|-|to)\s*([0-9](?:\.\d{1,3})?)\s*V\b",
+        r"\b([0-9](?:\.\d{1,3})?)\s*V\s*(?:~|-|to)\s*([0-9](?:\.\d{1,3})?)\s*V\b",
+    ]
+    for pat in range_patterns:
+        for m in re.finditer(pat, text, flags=re.IGNORECASE):
+            v1 = safe_float(m.group(1)); v2 = safe_float(m.group(2))
+            if v1 is None or v2 is None:
+                continue
+            vmin, vmax = min(v1, v2), max(v1, v2)
+            if 1.0 <= vmin <= 5.5 and 1.0 <= vmax <= 5.5:
+                tokens.append(f"{vmin:g}V~{vmax:g}V")
+
+    # 单电压 1.8V / 3.3V / 3V / 1.65V 等
+    for m in re.finditer(r"\b(?:1\.8|1\.65|1\.7|1\.75|1\.95|2\.5|2\.7|3|3\.0|3\.3)\s*V\b", text, flags=re.IGNORECASE):
+        tokens.append(re.sub(r"\s+", "", m.group(0)))
+
+    # WV / Wide Voltage / 宽压
+    if re.search(r"\bWV\b|Wide\s*Voltage|宽压", text, flags=re.IGNORECASE):
+        tokens.append("WV")
+
+    # 去重，保留顺序；同时清理 range 中的 'V~' 为显示友好格式
+    out = []
+    seen = set()
+    for t in tokens:
+        t = t.replace("V~", "~").replace("v", "V")
+        key = t.upper()
+        if key not in seen:
+            seen.add(key)
+            out.append(t)
+    return out
+
+
 def infer_voltage_from_text(value: str) -> dict:
     raw = normalize_display_text(value)
     if not raw:
         return build_voltage_dict(None, None, "低")
+
+    # 先尝试精确范围解析
     vmin, vmax = parse_voltage_from_text(raw)
     if vmin is not None and vmax is not None:
         return build_voltage_dict(vmin, vmax, "产品页")
 
-    s = raw.upper().replace(" ", "")
-    display = raw
+    tokens = extract_voltage_tokens_from_text(raw)
+    if not tokens:
+        # 关键优化：没有明确电压 token 时返回空，避免 Current Monitor 等特性字段误判为电压。
+        return build_voltage_dict(None, None, "低")
+
+    display = " / ".join(tokens)
     vtype = ""
-    if re.search(r"1\.8\s*V|1V8|1\.8VONLY", s):
-        vtype = "1.8V"
-    elif re.search(r"3\.3\s*V|3V3", s):
-        vtype = "3.3V"
-    elif re.search(r"\b3\s*V\b|[^0-9]3V|^3V", s):
-        vtype = "3V"
-    elif "WV" in s or "WIDE" in s or "宽压" in raw:
+    compact = display.upper().replace(" ", "")
+    if "WV" in compact or "WIDE" in compact or "宽压" in display:
         vtype = "宽压"
-    elif s:
-        vtype = raw
+    elif "1.8V/3.3V" in compact or ("1.8V" in compact and "3.3V" in compact):
+        vtype = "1.8V/3.3V"
+    elif re.search(r"\b1\.8V\b", display, flags=re.IGNORECASE):
+        vtype = "1.8V"
+    elif re.search(r"\b3\.3V\b", display, flags=re.IGNORECASE):
+        vtype = "3.3V"
+    elif re.search(r"\b3V\b", display, flags=re.IGNORECASE):
+        vtype = "3V"
+    else:
+        vtype = display
     return {"vcc_min": None, "vcc_max": None, "display": display, "voltage_type": vtype, "confidence": "产品页"}
 
 
@@ -1848,10 +2081,12 @@ def extract_all_temperature_ranges(text: str) -> dict:
 def render_spec_card(label: str, value: str, caption: str = ""):
     value = normalize_display_text(value)
     caption = normalize_display_text(caption)
+    if "温度" in str(label):
+        value = value.replace(" / ", "<br>").replace(",", "<br>").replace("，", "<br>")
     html = (
-        f'<div style="min-height:118px; padding:8px 0 10px 0;">'
+        f'<div style="min-height:132px; padding:8px 0 10px 0;">'
         f'<div style="font-size:13px; color:#374151; margin-bottom:8px;">{label}</div>'
-        f'<div style="font-size:27px; line-height:1.22; font-weight:500; color:#111827; white-space:normal; word-break:break-word; overflow-wrap:anywhere;">{value or "&nbsp;"}</div>'
+        f'<div style="font-size:25px; line-height:1.28; font-weight:500; color:#111827; white-space:normal; word-break:break-word; overflow-wrap:anywhere;">{value or "&nbsp;"}</div>'
         f'<div style="font-size:12px; color:#6b7280; margin-top:10px; white-space:normal; word-break:break-word; overflow-wrap:anywhere;">{caption or "&nbsp;"}</div>'
         f'</div>'
     )
@@ -2309,8 +2544,8 @@ def recommend_xtx(spec: dict, xtx_df: pd.DataFrame, weights_df: pd.DataFrame, to
 # 页面 UI
 # =========================================================
 
-st.title("🔎 竞品规格书解析与 XTX 对标推荐工具 V8")
-st.caption("V8：自动模式优先读取友商官网产品中心/详情页；PDF 只作为链接或本地 PDF 库备用；manual_value 默认清空，空值时使用 extracted_value 推荐。")
+st.title("🔎 竞品规格书解析与 XTX 对标推荐工具 V9")
+st.caption("V9：优先用友商官网产品中心/详情页结构化字段；动态页面可自动尝试 Playwright 渲染；信息来源支持多选；PDF 作为下载链接或备用库。")
 
 with st.sidebar:
     st.header("维护数据上传")
@@ -2324,7 +2559,13 @@ with st.sidebar:
         type=["xlsx"],
         help="如果不上传，程序会尝试读取本地 competitor_analysis_history.xlsx。",
     )
-    max_pages = st.slider("每家官网产品中心最大检索页数", min_value=1, max_value=8, value=3, step=1, help="建议 2~3。V8 自动模式只查产品中心/产品详情页，不再下载或扫描官网 PDF。")
+    max_pages = st.slider("每家官网产品中心最大检索页数", min_value=1, max_value=8, value=3, step=1, help="建议 2~3。V9 自动模式优先查产品中心/产品详情页，不下载或扫描官网 PDF。")
+    use_playwright_render = st.checkbox("动态页面失败时尝试 Playwright 渲染", value=True, help="适合 Winbond / GigaDevice 等前端动态加载页面。首次运行可能较慢；Streamlit Cloud 需要安装 Playwright 浏览器。")
+    search_time_budget = st.slider("单家公司搜索超时秒数", min_value=10, max_value=120, value=45, step=5, help="超过该时间会自动停止该公司搜索，避免长时间卡住。")
+    if st.button("终止/清空本次搜索状态", help="如果页面卡住，可以点击后重新开始；Streamlit 正在执行的请求可能需要刷新页面或等待本轮超时。"):
+        st.session_state["last_result"] = None
+        st.session_state["stop_requested"] = True
+        st.warning("已请求终止/清空。若当前请求仍在执行，请刷新页面或等待超时后重试。")
     pdf_library_files = st.file_uploader(
         "上传竞品 PDF 库（可多选，可选）",
         type=["pdf"],
@@ -2372,7 +2613,7 @@ with st.expander("下载/查看维护文件格式", expanded=False):
 | History_Log | 历史分析记录 | 可选 |
 | PDF_Library | 竞品规格书 PDF 库索引；实际 PDF 可放入仓库 pdf_library/ 或网页左侧上传 | 可选 |
 
-V8 建议在 `Company_Master` 增加 `model_prefixes` 字段，例如 Boya 填 `BY,BY25,BY26`，这样自动检索时会先按型号前缀锁定厂商，速度更快。V8 自动模式不下载/扫描官网 PDF，只把官网 PDF 作为下载链接。
+V9 建议在 `Company_Master` 增加 `model_prefixes` 字段，例如 Boya 填 `BY,BY25,BY26`，这样自动检索时会先按型号前缀锁定厂商，速度更快。V9 自动模式优先解析官网产品中心/详情页；PDF 默认只作为下载链接或 PDF 库备用。
 """
     )
     template_bytes = to_excel_bytes(
@@ -2385,9 +2626,9 @@ V8 建议在 `Company_Master` 增加 `model_prefixes` 字段，例如 Boya 填 `
         }
     )
     st.download_button(
-        "下载维护数据库 XLSX 模板 V8",
+        "下载维护数据库 XLSX 模板 V9",
         data=template_bytes,
-        file_name="xtx_competitor_maintenance_template_v7.xlsx",
+        file_name="xtx_competitor_maintenance_template_v9.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
@@ -2402,22 +2643,27 @@ with col3:
     product_type = st.selectbox("产品类型", PRODUCT_TYPE_OPTIONS, index=0)
 
 st.subheader("2. 选择信息来源")
-source_mode = st.radio(
-    "信息来源",
-    ["自动从友商官网产品中心查找", "PDF库搜索", "输入 PDF 链接", "手动上传 PDF"],
-    horizontal=True,
+SOURCE_OPTIONS = ["自动从友商官网产品中心查找", "PDF库搜索", "输入 PDF 链接", "手动上传 PDF"]
+source_modes = st.multiselect(
+    "信息来源（可多选，按显示顺序依次尝试）",
+    SOURCE_OPTIONS,
+    default=["自动从友商官网产品中心查找"],
+    help="只勾选官网产品中心时，工具只查官网产品中心/详情页；勾选多个来源时，前一个来源未命中会继续尝试下一个来源。",
 )
+if not source_modes:
+    source_modes = ["自动从友商官网产品中心查找"]
 
 pdf_url_input = ""
 uploaded_pdf = None
-if source_mode == "输入 PDF 链接":
+if "输入 PDF 链接" in source_modes:
     pdf_url_input = st.text_input("PDF 链接", placeholder="https://...pdf")
-elif source_mode == "手动上传 PDF":
+if "手动上传 PDF" in source_modes:
     uploaded_pdf = st.file_uploader("上传竞品规格书 PDF", type=["pdf"])
 
 run = st.button("开始解析/匹配", type="primary")
 
 if run:
+    st.session_state.pop("stop_requested", None)
     if not competitor_model:
         st.error("请先输入竞品型号。")
         st.stop()
@@ -2426,114 +2672,125 @@ if run:
     selected_pdf_url = ""
     candidate_df = pd.DataFrame()
     search_note = ""
+    spec = None
+    hit_source = ""
 
     with st.status("正在处理...", expanded=True) as status:
-        if source_mode == "手动上传 PDF":
-            if uploaded_pdf is None:
-                st.error("请上传 PDF。")
-                st.stop()
-            st.write("读取上传的 PDF...")
-            pdf_bytes = uploaded_pdf.read()
-            selected_pdf_url = "用户手动上传 PDF"
+        for source_mode in source_modes:
+            if spec is not None:
+                break
 
-        elif source_mode == "输入 PDF 链接":
-            if not valid_url(pdf_url_input):
-                st.error("请输入有效的 PDF 链接。")
-                st.stop()
-            st.write("下载并校验 PDF...")
-            try:
-                pdf_bytes = download_pdf(pdf_url_input)
-                found, page_no, method = scan_pdf_for_model_fast(pdf_bytes, competitor_model, max_pages=None)
-                if not found:
-                    st.warning("该 PDF 全文未快速定位到输入型号，请确认链接是否正确；仍会继续解析。")
+            if st.session_state.get("stop_requested"):
+                st.warning("已收到终止请求，本次搜索停止。")
+                break
+
+            if source_mode in ["自动从友商官网产品中心查找", "自动从友商官网白名单查找"]:
+                if competitor_company_df.empty:
+                    st.warning("友商官网白名单为空，请检查 Company_Master 中 company_role=Competitor 的记录。")
+                    continue
+
+                search_df, search_note = infer_company_df_by_model(competitor_company_df, competitor_model, selected_company)
+                st.write(search_note)
+                st.write(f"本次检索厂商数：{len(search_df)}")
+                st.write("正在检索友商官网产品中心 / 产品详情页...")
+
+                product_page_df = crawl_product_pages_parallel(
+                    search_df,
+                    competitor_model,
+                    max_pages=max_pages,
+                    use_playwright=use_playwright_render,
+                    max_seconds=search_time_budget,
+                )
+                if not product_page_df.empty:
+                    best_page = product_page_df.iloc[0]
+                    spec = spec_from_product_page_row(best_page, selected_type=product_type, model=competitor_model)
+                    selected_pdf_url = str(best_page.get("datasheet_url", "") or best_page.get("page_url", ""))
+                    candidate_df = product_page_df
+                    hit_source = "官网产品中心/详情页"
+                    st.write("已在官网产品中心/详情页匹配到目标型号；字段解析来自官网产品页，不下载、不扫描官网 PDF。")
+                    st.write(str(best_page.get("page_url", "")))
+                    if str(best_page.get("datasheet_url", "")):
+                        st.write("检测到官网规格书链接，仅作为下载入口：")
+                        st.write(str(best_page.get("datasheet_url", "")))
                 else:
-                    st.write(f"PDF 型号校验通过：第 {page_no} 页，{method}")
-                selected_pdf_url = pdf_url_input
-            except Exception as e:
-                st.error(f"PDF 下载失败：{e}")
-                st.stop()
+                    st.warning("未在官网产品中心/详情页匹配到型号。")
+                    continue
 
-        elif source_mode in ["自动从友商官网产品中心查找", "自动从友商官网白名单查找"]:
-            if competitor_company_df.empty:
-                st.error("友商官网白名单为空，请检查 Company_Master 中 company_role=Competitor 的记录。")
-                st.stop()
-
-            search_df, search_note = infer_company_df_by_model(competitor_company_df, competitor_model, selected_company)
-            st.write(search_note)
-            st.write(f"本次检索厂商数：{len(search_df)}")
-
-            st.write("正在检索友商官网产品中心 / 产品详情页...")
-            product_page_df = crawl_product_pages_parallel(search_df, competitor_model, max_pages=max_pages)
-
-            if not product_page_df.empty:
-                best_page = product_page_df.iloc[0]
-                spec = spec_from_product_page_row(best_page, selected_type=product_type, model=competitor_model)
-                selected_pdf_url = str(best_page.get("datasheet_url", "") or best_page.get("page_url", ""))
-                candidate_df = product_page_df
-                st.write("已在官网产品中心/详情页匹配到目标型号；字段解析来自官网产品页，不下载、不扫描官网 PDF。")
-                st.write(str(best_page.get("page_url", "")))
-                if str(best_page.get("datasheet_url", "")):
-                    st.write("检测到官网规格书链接，仅作为下载入口：")
-                    st.write(str(best_page.get("datasheet_url", "")))
-            else:
-                st.warning("未在官网产品中心/详情页匹配到型号，开始搜索 PDF 库。")
+            elif source_mode == "PDF库搜索":
+                st.write("正在搜索 PDF 库...")
                 scan_pages = None if int(pdf_library_scan_pages_input) == 0 else int(pdf_library_scan_pages_input)
                 hit, lib_df = search_pdf_library(pdf_library_items, competitor_model, max_scan_pages=scan_pages, max_files=pdf_library_max_files)
-                candidate_df = lib_df
+                candidate_df = lib_df if candidate_df.empty else pd.concat([candidate_df, lib_df], ignore_index=True)
                 if not hit:
-                    st.warning("官网产品中心未命中，PDF库也未命中。建议：1）确认型号完整后重试；2）上传该型号规格书到 PDF库；3）手动输入 PDF 链接或手动上传 PDF。")
-                    if not lib_df.empty:
-                        st.dataframe(lib_df, use_container_width=True)
-                    st.stop()
+                    st.warning("PDF库未命中目标型号。")
+                    continue
                 pdf_bytes = hit.get("pdf_bytes", b"")
                 if not pdf_bytes:
-                    st.error("PDF库索引已命中，但未找到实际PDF文件，也没有可下载的 pdf_source_url。请把PDF放入仓库 pdf_library/ 文件夹、左侧上传，或在 PDF_Library 中填写可访问的 pdf_source_url。")
-                    st.stop()
+                    st.warning("PDF库索引已命中，但未找到实际PDF文件，也没有可下载的 pdf_source_url。")
+                    continue
                 selected_pdf_url = f"PDF库：{hit.get('file_name', '')}"
                 st.write(f"已在 PDF库命中：{hit.get('file_name', '')}")
                 st.write("解析 PDF库命中的 PDF 文本...")
                 try:
                     pdf_text = extract_text_from_pdf_bytes(pdf_bytes, max_pages=pdf_parse_pages)
                 except Exception as e:
-                    st.error(f"PDF 解析失败：{e}")
-                    st.stop()
+                    st.warning(f"PDF 解析失败：{e}")
+                    continue
                 if not pdf_text.strip():
-                    st.error("PDF 未提取到有效文本，可能是扫描版 PDF，需要后续增加 OCR。")
-                    st.stop()
+                    st.warning("PDF 未提取到有效文本，可能是扫描版 PDF。")
+                    continue
                 spec = analyze_spec_text(pdf_text, selected_type=product_type, model=competitor_model)
+                hit_source = "PDF库"
 
-        elif source_mode == "PDF库搜索":
-            scan_pages = None if int(pdf_library_scan_pages_input) == 0 else int(pdf_library_scan_pages_input)
-            hit, lib_df = search_pdf_library(pdf_library_items, competitor_model, max_scan_pages=scan_pages, max_files=pdf_library_max_files)
-            candidate_df = lib_df
-            if not hit:
-                st.error("PDF库未命中目标型号。请先在左侧上传PDF库，或把PDF提交到GitHub仓库的 pdf_library/ 文件夹。")
-                if not lib_df.empty:
-                    st.dataframe(lib_df, use_container_width=True)
-                st.stop()
-            pdf_bytes = hit.get("pdf_bytes", b"")
-            if not pdf_bytes:
-                st.error("PDF库索引已命中，但未找到实际PDF文件，也没有可下载的 pdf_source_url。请把PDF放入仓库 pdf_library/ 文件夹、左侧上传，或在 PDF_Library 中填写可访问的 pdf_source_url。")
-                st.stop()
-            selected_pdf_url = f"PDF库：{hit.get('file_name', '')}"
-            st.write(f"已在 PDF库命中：{hit.get('file_name', '')}")
+            elif source_mode == "输入 PDF 链接":
+                if not valid_url(pdf_url_input):
+                    st.warning("已选择输入 PDF 链接，但链接为空或无效，跳过该来源。")
+                    continue
+                st.write("下载并校验 PDF...")
+                try:
+                    pdf_bytes = download_pdf(pdf_url_input)
+                    found, page_no, method = scan_pdf_for_model_fast(pdf_bytes, competitor_model, max_pages=None)
+                    if not found:
+                        st.warning("该 PDF 全文未快速定位到输入型号，请确认链接是否正确；仍会继续解析。")
+                    else:
+                        st.write(f"PDF 型号校验通过：第 {page_no} 页，{method}")
+                    selected_pdf_url = pdf_url_input
+                    pdf_text = extract_text_from_pdf_bytes(pdf_bytes, max_pages=pdf_parse_pages)
+                    if not pdf_text.strip():
+                        st.warning("PDF 未提取到有效文本，可能是扫描版 PDF。")
+                        continue
+                    spec = analyze_spec_text(pdf_text, selected_type=product_type, model=competitor_model)
+                    hit_source = "输入PDF链接"
+                except Exception as e:
+                    st.warning(f"PDF 下载/解析失败：{e}")
+                    continue
 
+            elif source_mode == "手动上传 PDF":
+                if uploaded_pdf is None:
+                    st.warning("已选择手动上传 PDF，但未上传文件，跳过该来源。")
+                    continue
+                st.write("读取上传的 PDF...")
+                try:
+                    pdf_bytes = uploaded_pdf.read()
+                    selected_pdf_url = "用户手动上传 PDF"
+                    pdf_text = extract_text_from_pdf_bytes(pdf_bytes, max_pages=pdf_parse_pages)
+                    if not pdf_text.strip():
+                        st.warning("PDF 未提取到有效文本，可能是扫描版 PDF。")
+                        continue
+                    spec = analyze_spec_text(pdf_text, selected_type=product_type, model=competitor_model)
+                    hit_source = "手动上传PDF"
+                except Exception as e:
+                    st.warning(f"上传 PDF 解析失败：{e}")
+                    continue
 
-        if source_mode in ["手动上传 PDF", "输入 PDF 链接", "PDF库搜索"]:
-            st.write("解析 PDF 文本...")
-            try:
-                pdf_text = extract_text_from_pdf_bytes(pdf_bytes, max_pages=pdf_parse_pages)
-            except Exception as e:
-                st.error(f"PDF 解析失败：{e}")
-                st.stop()
+        if spec is None:
+            st.warning("所有已勾选的信息来源均未命中。建议：1）确认型号完整；2）启用 Playwright；3）上传 PDF 到 PDF库；4）手动输入 PDF 链接或手动上传 PDF。")
+            if not candidate_df.empty:
+                st.dataframe(candidate_df, use_container_width=True)
+            status.update(label="未匹配到结果", state="complete", expanded=False)
+            st.stop()
 
-            if not pdf_text.strip():
-                st.error("PDF 未提取到有效文本，可能是扫描版 PDF，需要后续增加 OCR。")
-                st.stop()
-
-            st.write("抽取产品类型、容量、电压、封装、温度...")
-            spec = analyze_spec_text(pdf_text, selected_type=product_type, model=competitor_model)
-
+        # V9：如果官网返回的是 1.8V/WV/3.3V 等标称电压，保留原文显示；如果为空，不强行从 Feature 文本误抽取。
         analysis_id = f"{normalize_model(competitor_model)}_{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
         st.session_state["last_result"] = {
             "analysis_id": analysis_id,
@@ -2545,6 +2802,7 @@ if run:
             "product_type": product_type,
             "review_df": spec_to_review_df(spec),
             "search_note": search_note,
+            "hit_source": hit_source,
         }
         status.update(label="解析/匹配完成", state="complete", expanded=False)
 
