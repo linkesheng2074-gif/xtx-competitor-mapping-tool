@@ -1,5 +1,5 @@
 """
-XTX 竞品规格书解析与对标推荐工具 V7
+XTX 竞品规格书解析与对标推荐工具 V8
 =================================
 运行方式：
     pip install -r requirements.txt
@@ -37,7 +37,7 @@ from rapidfuzz import fuzz
 # =========================================================
 
 st.set_page_config(
-    page_title="竞品规格书解析与 XTX 对标推荐工具 V7",
+    page_title="竞品规格书解析与 XTX 对标推荐工具 V8",
     page_icon="🔎",
     layout="wide",
 )
@@ -697,6 +697,23 @@ def build_direct_product_urls(company: str, base_url: str, model: str) -> list[s
     if "puy" in company_l:
         urls.append("https://www.puyasemi.com/product.html")
 
+    # V8：所有友商都按“产品中心/站内搜索/产品详情页”优先规则尝试。
+    base = str(base_url or "").rstrip("/")
+    model_q = quote_plus(model)
+    if base:
+        common_paths = [
+            "/product", "/products", "/product-center", "/product_center", "/products-center",
+            "/product.html", "/products.html", "/en/products", "/en/product", "/zh/products", "/zh/product",
+            f"/search?keyword={model_q}", f"/search?keywords={model_q}", f"/search?q={model_q}",
+            f"/search.aspx?key={model_q}", f"/search.aspx?keyword={model_q}", f"/search.html?keyword={model_q}",
+            f"/?s={model_q}", f"/?search={model_q}",
+        ]
+        for path in common_paths:
+            urls.append(base + path)
+        for slug in slugs:
+            for path in ["/product", "/products", "/product/detail", "/products/detail", "/en/product", "/en/products", "/zh/product", "/zh/products"]:
+                urls.append(base + path + "/" + slug)
+
     return [u for u in dict.fromkeys(urls) if valid_url(u)]
 
 
@@ -805,7 +822,7 @@ def product_detail_row_from_page(html: str, current_url: str, model: str, compan
     }
 
 def crawl_company_for_product_page(company_row: pd.Series, model: str, max_pages: int = 3) -> pd.DataFrame:
-    """V7：只检索官网产品中心/产品详情页，不再在自动模式下下载或扫描 PDF。"""
+    """V8：只检索官网产品中心/产品详情页，不再在自动模式下下载或扫描 PDF。"""
     company = str(company_row.get("company_name", "")).strip()
     domain = str(company_row.get("domain", "")).strip()
     base_url = str(company_row.get("base_url", "")).strip()
@@ -958,10 +975,9 @@ def spec_from_product_page_row(row: pd.Series, selected_type: str, model: str) -
         if density_mb is None:
             density_mb, density_display = parse_density_from_text(row_text)
 
-        vmin, vmax = parse_voltage_from_text(vcc_text or row_text)
-        voltage = build_voltage_dict(vmin, vmax, "产品页" if vmin is not None else "低")
+        voltage = infer_voltage_from_text(vcc_text or row_text)
         package = extract_package(package_text) if package_text else {"package": "", "package_size": "", "confidence": "低"}
-        temp = extract_temperature(temp_text) if temp_text else build_temperature_dict(None, None, "低")
+        temp = extract_all_temperature_ranges(temp_text) if temp_text else build_temperature_dict(None, None, "低")
 
     return {
         "product_type": product_type.get("product_type", ""),
@@ -994,7 +1010,7 @@ def build_seed_urls(company: str, base_url: str, search_template: str, model: st
         else:
             seeds.append(search_template)
 
-    # V7：优先尝试产品中心/产品详情页直达链接，避免从首页慢速爬取。
+    # V8：优先尝试产品中心/产品详情页直达链接，避免从首页慢速爬取。
     seeds.extend(build_direct_product_urls(company, base_url, model))
     seeds.append(base_url)
     base = base_url.rstrip("/")
@@ -1764,6 +1780,83 @@ def build_analysis_texts(text: str, model: str) -> tuple[str, str]:
     return first_part, text
 
 
+
+
+def normalize_display_text(value) -> str:
+    if value is None:
+        return ""
+    s = str(value).strip()
+    if s.lower() in ["nan", "none", "null"]:
+        return ""
+    return s.replace("℃", "°C").replace("～", "~").replace("–", "-").replace("—", "-")
+
+
+def infer_voltage_from_text(value: str) -> dict:
+    raw = normalize_display_text(value)
+    if not raw:
+        return build_voltage_dict(None, None, "低")
+    vmin, vmax = parse_voltage_from_text(raw)
+    if vmin is not None and vmax is not None:
+        return build_voltage_dict(vmin, vmax, "产品页")
+
+    s = raw.upper().replace(" ", "")
+    display = raw
+    vtype = ""
+    if re.search(r"1\.8\s*V|1V8|1\.8VONLY", s):
+        vtype = "1.8V"
+    elif re.search(r"3\.3\s*V|3V3", s):
+        vtype = "3.3V"
+    elif re.search(r"\b3\s*V\b|[^0-9]3V|^3V", s):
+        vtype = "3V"
+    elif "WV" in s or "WIDE" in s or "宽压" in raw:
+        vtype = "宽压"
+    elif s:
+        vtype = raw
+    return {"vcc_min": None, "vcc_max": None, "display": display, "voltage_type": vtype, "confidence": "产品页"}
+
+
+def extract_all_temperature_ranges(text: str) -> dict:
+    raw = normalize_display_text(text)
+    if not raw:
+        return build_temperature_dict(None, None, "低")
+    t = raw.replace("TO", "to")
+    patterns = [
+        r"(-?\d{1,3})\s*°?\s*C\s*(?:to|-|~)\s*(-?\d{1,3})\s*°?\s*C",
+        r"(-?\d{1,3})\s*(?:to|-|~)\s*(-?\d{1,3})\s*°?\s*C",
+    ]
+    ranges = []
+    seen = set()
+    for pattern in patterns:
+        for m in re.finditer(pattern, t, flags=re.IGNORECASE):
+            a, b = int(m.group(1)), int(m.group(2))
+            tmin, tmax = min(a, b), max(a, b)
+            if -65 <= tmin <= 25 and 70 <= tmax <= 150:
+                key = (tmin, tmax)
+                if key not in seen:
+                    seen.add(key)
+                    ranges.append(key)
+    if not ranges:
+        return build_temperature_dict(None, None, "低")
+    disp = " / ".join([f"{a}°C~{b}°C" for a, b in ranges])
+    min_t = min(a for a, _ in ranges)
+    max_t = max(b for _, b in ranges)
+    base = build_temperature_dict(min_t, max_t, "产品页")
+    base["display"] = disp
+    return base
+
+
+def render_spec_card(label: str, value: str, caption: str = ""):
+    value = normalize_display_text(value)
+    caption = normalize_display_text(caption)
+    html = (
+        f'<div style="min-height:118px; padding:8px 0 10px 0;">'
+        f'<div style="font-size:13px; color:#374151; margin-bottom:8px;">{label}</div>'
+        f'<div style="font-size:27px; line-height:1.22; font-weight:500; color:#111827; white-space:normal; word-break:break-word; overflow-wrap:anywhere;">{value or "&nbsp;"}</div>'
+        f'<div style="font-size:12px; color:#6b7280; margin-top:10px; white-space:normal; word-break:break-word; overflow-wrap:anywhere;">{caption or "&nbsp;"}</div>'
+        f'</div>'
+    )
+    st.markdown(html, unsafe_allow_html=True)
+
 def analyze_spec_text(text: str, selected_type: str, model: str) -> dict:
     focus_text, full_text = build_analysis_texts(text, model)
 
@@ -2216,8 +2309,8 @@ def recommend_xtx(spec: dict, xtx_df: pd.DataFrame, weights_df: pd.DataFrame, to
 # 页面 UI
 # =========================================================
 
-st.title("🔎 竞品规格书解析与 XTX 对标推荐工具 V7")
-st.caption("V7：自动检索只读取友商官网产品中心/产品详情页；PDF 只作为链接或本地 PDF 库备用；推荐数据源为 XTX_Product_Library。")
+st.title("🔎 竞品规格书解析与 XTX 对标推荐工具 V8")
+st.caption("V8：自动模式优先读取友商官网产品中心/详情页；PDF 只作为链接或本地 PDF 库备用；manual_value 默认清空，空值时使用 extracted_value 推荐。")
 
 with st.sidebar:
     st.header("维护数据上传")
@@ -2231,7 +2324,7 @@ with st.sidebar:
         type=["xlsx"],
         help="如果不上传，程序会尝试读取本地 competitor_analysis_history.xlsx。",
     )
-    max_pages = st.slider("每家官网产品中心最大检索页数", min_value=1, max_value=8, value=3, step=1, help="建议 2~3。V7 自动模式只查产品中心/产品详情页，不再下载或扫描官网 PDF。")
+    max_pages = st.slider("每家官网产品中心最大检索页数", min_value=1, max_value=8, value=3, step=1, help="建议 2~3。V8 自动模式只查产品中心/产品详情页，不再下载或扫描官网 PDF。")
     pdf_library_files = st.file_uploader(
         "上传竞品 PDF 库（可多选，可选）",
         type=["pdf"],
@@ -2279,7 +2372,7 @@ with st.expander("下载/查看维护文件格式", expanded=False):
 | History_Log | 历史分析记录 | 可选 |
 | PDF_Library | 竞品规格书 PDF 库索引；实际 PDF 可放入仓库 pdf_library/ 或网页左侧上传 | 可选 |
 
-V7 建议在 `Company_Master` 增加 `model_prefixes` 字段，例如 Boya 填 `BY,BY25,BY26`，这样自动检索时会先按型号前缀锁定厂商，速度更快。V7 自动模式不下载/扫描官网 PDF，只把官网 PDF 作为下载链接。
+V8 建议在 `Company_Master` 增加 `model_prefixes` 字段，例如 Boya 填 `BY,BY25,BY26`，这样自动检索时会先按型号前缀锁定厂商，速度更快。V8 自动模式不下载/扫描官网 PDF，只把官网 PDF 作为下载链接。
 """
     )
     template_bytes = to_excel_bytes(
@@ -2292,7 +2385,7 @@ V7 建议在 `Company_Master` 增加 `model_prefixes` 字段，例如 Boya 填 `
         }
     )
     st.download_button(
-        "下载维护数据库 XLSX 模板 V7",
+        "下载维护数据库 XLSX 模板 V8",
         data=template_bytes,
         file_name="xtx_competitor_maintenance_template_v7.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -2441,7 +2534,9 @@ if run:
             st.write("抽取产品类型、容量、电压、封装、温度...")
             spec = analyze_spec_text(pdf_text, selected_type=product_type, model=competitor_model)
 
+        analysis_id = f"{normalize_model(competitor_model)}_{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
         st.session_state["last_result"] = {
+            "analysis_id": analysis_id,
             "spec": spec,
             "candidate_df": candidate_df,
             "selected_pdf_url": selected_pdf_url,
@@ -2464,22 +2559,17 @@ if "last_result" in st.session_state:
 
     st.divider()
     st.subheader("3. 自动解析结果")
-    m1, m2, m3, m4, m5 = st.columns(5)
+    m1, m2, m3, m4, m5 = st.columns([1.0, 1.0, 1.15, 1.7, 1.9])
     with m1:
-        st.metric("产品类型", spec.get("product_type", ""))
-        st.caption(f"置信度：{spec.get('product_type_confidence', '')}")
+        render_spec_card("产品类型", spec.get("product_type", ""), f"置信度：{spec.get('product_type_confidence', '')}")
     with m2:
-        st.metric("容量", spec.get("capacity", ""))
-        st.caption(f"置信度：{spec.get('capacity_confidence', '')}")
+        render_spec_card("容量", spec.get("capacity", ""), f"置信度：{spec.get('capacity_confidence', '')}")
     with m3:
-        st.metric("电压范围", spec.get("voltage_range", ""))
-        st.caption(f"{spec.get('voltage_type', '')}，置信度：{spec.get('voltage_confidence', '')}")
+        render_spec_card("电压范围", spec.get("voltage_range", ""), f"{spec.get('voltage_type', '')}，置信度：{spec.get('voltage_confidence', '')}")
     with m4:
-        st.metric("封装形式", spec.get("package", ""))
-        st.caption(f"尺寸：{spec.get('package_size', '')}，置信度：{spec.get('package_confidence', '')}")
+        render_spec_card("封装形式", spec.get("package", ""), f"尺寸：{spec.get('package_size', '')}，置信度：{spec.get('package_confidence', '')}")
     with m5:
-        st.metric("温度范围", spec.get("temperature", ""))
-        st.caption(f"{spec.get('temp_grade', '')}，置信度：{spec.get('temperature_confidence', '')}")
+        render_spec_card("温度范围", spec.get("temperature", ""), f"{spec.get('temp_grade', '')}，置信度：{spec.get('temperature_confidence', '')}")
 
     if result.get("search_note"):
         st.info(result["search_note"])
@@ -2496,7 +2586,7 @@ if "last_result" in st.session_state:
 
     st.divider()
     st.subheader("4. 选型确认 / 修正")
-    st.caption("自动解析结果仅作为参考。manual_value 列提供下拉选项，选项来自 XTX_Product_Library；修改后下方 XTX 对标推荐会自动刷新。")
+    st.caption("自动解析结果仅作为参考。manual_value 默认清空；为空时按 extracted_value 推荐，有选择时按 manual_value 推荐。下拉选项来自 XTX_Product_Library。")
 
     options = build_selection_options(xtx_df)
     review_rows = spec_to_review_df(spec).to_dict("records")
@@ -2527,12 +2617,14 @@ if "last_result" in st.session_state:
     for col, title in zip(hcols, ["field_key", "field_name", "extracted_value", "manual_value", "confidence", "confirm_status"]):
         col.markdown(f'<div class="xtx-manual-header">{title}</div>', unsafe_allow_html=True)
 
+    analysis_id = result.get("analysis_id", normalize_model(competitor_model_result))
     manual_values = {}
     confirm_map = {}
     for row in review_rows:
         key = str(row.get("field_key", "")).strip()
         row_options, kind, current_value = option_map.get(key, ([""], "text", ""))
-        default_idx = find_option_index(row_options, current_value, kind)
+        # V8：manual_value 每次新解析默认清空。空值代表使用 extracted_value；只有用户显式选择后才覆盖。
+        default_idx = 0
         rcols = st.columns([1.1, 1.4, 2.2, 2.3, 1.4, 1.1])
         rcols[0].markdown(f'<div class="xtx-manual-cell xtx-small">{key}</div>', unsafe_allow_html=True)
         rcols[1].markdown(f'<div class="xtx-manual-cell xtx-small">{row.get("field_name", "")}</div>', unsafe_allow_html=True)
@@ -2542,7 +2634,7 @@ if "last_result" in st.session_state:
                 label=f"manual_value_{key}",
                 options=row_options,
                 index=default_idx,
-                key=f"manual_value_v6_{key}",
+                key=f"manual_value_v8_{analysis_id}_{key}",
                 label_visibility="collapsed",
             )
         manual_values[key] = selected
@@ -2577,7 +2669,7 @@ if "last_result" in st.session_state:
 
     st.divider()
     st.subheader("5. XTX 对标型号推荐")
-    st.caption("V6 推荐规则：XTX 对标型号只参考 XTX_Product_Library，不联网抓 XTX 官网；只有产品类型、容量两项核心条件一致，才会进入推荐列表。")
+    st.caption("V8 推荐规则：XTX 对标型号只参考 XTX_Product_Library；manual_value 为空时使用 extracted_value，有内容时使用 manual_value；产品类型、容量两项核心条件一致即进入推荐列表。")
     recommend_df, rec_warnings = recommend_xtx(confirmed_spec, xtx_df, weights_df, top_n=10)
     for w in rec_warnings:
         st.warning(w)
