@@ -1,5 +1,5 @@
 """
-XTX 竞品规格书解析与对标推荐工具 V3
+XTX 竞品规格书解析与对标推荐工具 V4
 =================================
 运行方式：
     pip install -r requirements.txt
@@ -36,14 +36,14 @@ from rapidfuzz import fuzz
 # =========================================================
 
 st.set_page_config(
-    page_title="竞品规格书解析与 XTX 对标推荐工具 V3",
+    page_title="竞品规格书解析与 XTX 对标推荐工具 V4",
     page_icon="🔎",
     layout="wide",
 )
 
-REQUEST_TIMEOUT = 8
-DEFAULT_MAX_CRAWL_PAGES = 6
-MAX_PDF_CANDIDATES = 25
+REQUEST_TIMEOUT = 5
+DEFAULT_MAX_CRAWL_PAGES = 3
+MAX_PDF_CANDIDATES = 8
 LOCAL_HISTORY_PATH = "competitor_analysis_history.xlsx"
 
 HEADERS = {
@@ -329,8 +329,44 @@ def same_domain_or_subdomain(url: str, allowed_domain: str) -> bool:
     return bool(allowed) and (current == allowed or current.endswith("." + allowed))
 
 
+class CachedResponse:
+    def __init__(self, data: dict):
+        self.url = data.get("url", "")
+        self.status_code = int(data.get("status_code", 0))
+        self.headers = data.get("headers", {}) or {}
+        self.content = data.get("content", b"") or b""
+
+    @property
+    def text(self) -> str:
+        encoding = "utf-8"
+        ctype = self.headers.get("Content-Type", "") or self.headers.get("content-type", "")
+        m = re.search(r"charset=([\w\-]+)", ctype, flags=re.IGNORECASE)
+        if m:
+            encoding = m.group(1)
+        try:
+            return self.content.decode(encoding, errors="replace")
+        except Exception:
+            return self.content.decode("utf-8", errors="replace")
+
+    def raise_for_status(self):
+        if self.status_code >= 400 or self.status_code == 0:
+            raise requests.HTTPError(f"HTTP {self.status_code} for {self.url}")
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def cached_get_url(url: str) -> dict:
+    """缓存官网页面/PDF下载结果，避免 Streamlit rerun 时重复请求同一链接。"""
+    resp = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+    return {
+        "url": resp.url,
+        "status_code": resp.status_code,
+        "headers": dict(resp.headers),
+        "content": resp.content,
+    }
+
+
 def request_url(url: str):
-    return requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+    return CachedResponse(cached_get_url(url))
 
 
 def values_match(a, b, tol=0.15) -> bool:
@@ -429,6 +465,234 @@ def page_text_contains_model(html: str, model: str) -> bool:
         return False
     text = BeautifulSoup(html, "html.parser").get_text(" ", strip=True)
     return model_norm in normalize_model(text)
+
+
+
+def normalize_header_name(name: str) -> str:
+    """把产品页表头映射成统一字段。"""
+    n = re.sub(r"[\s\n\r\t:：.。/()（）_-]+", "", str(name or "")).lower()
+    if n in ["density", "capacity", "memory", "容量"] or "density" in n or "capacity" in n:
+        return "density"
+    if n in ["partno", "partnumber", "model", "型号", "料号"] or "part" in n or "model" in n:
+        return "part_no"
+    if n in ["vcc", "voltage", "电压"] or "vcc" in n or "voltage" in n:
+        return "vcc"
+    if n in ["frequency", "freq", "speed", "频率"] or "frequency" in n or "freq" in n:
+        return "frequency"
+    if n in ["feature", "features", "功能", "特性"] or "feature" in n:
+        return "feature"
+    if n in ["package", "pkg", "封装"] or "package" in n:
+        return "package"
+    if n in ["tem", "temp", "temperature", "operatingtemperature", "温度"] or "temp" in n or n == "tem":
+        return "temperature"
+    if n in ["status", "状态"] or "status" in n:
+        return "status"
+    return n or "col"
+
+
+def table_rows_containing_model(html: str, model: str, current_url: str) -> list[dict]:
+    """从官网产品页 HTML 表格中抽取包含目标型号的行。"""
+    soup = BeautifulSoup(html, "html.parser")
+    model_norm = normalize_model(model)
+    rows_out = []
+    if not model_norm:
+        return rows_out
+
+    for table_idx, table in enumerate(soup.find_all("table")):
+        trs = table.find_all("tr")
+        if not trs:
+            continue
+
+        headers = []
+        header_tr_index = 0
+        for i, tr in enumerate(trs[:3]):
+            cells = tr.find_all(["th", "td"])
+            texts = [c.get_text(" ", strip=True) for c in cells]
+            if any(normalize_header_name(t) in ["density", "part_no", "vcc", "package", "temperature"] for t in texts):
+                headers = [normalize_header_name(t) for t in texts]
+                header_tr_index = i
+                break
+
+        if not headers:
+            first_cells = trs[0].find_all(["th", "td"])
+            headers = [normalize_header_name(c.get_text(" ", strip=True)) for c in first_cells]
+            header_tr_index = 0
+
+        for tr in trs[header_tr_index + 1:]:
+            cells = tr.find_all(["td", "th"])
+            values = [c.get_text(" ", strip=True) for c in cells]
+            if not values:
+                continue
+            row_text = " ".join(values)
+            if model_norm not in normalize_model(row_text):
+                continue
+
+            row = {"source_url": current_url, "table_index": table_idx, "row_text": row_text}
+            for idx, value in enumerate(values):
+                key = headers[idx] if idx < len(headers) and headers[idx] else f"col_{idx}"
+                # 避免重复表头覆盖，把重复列拼接起来
+                if key in row and str(row[key]).strip():
+                    row[key] = f"{row[key]} | {value}"
+                else:
+                    row[key] = value
+            rows_out.append(row)
+    return rows_out
+
+
+def extract_pdf_links_from_page(html: str, current_url: str, domain: str, model: str) -> list[dict]:
+    links = extract_links_from_html(html, current_url)
+    pdfs = []
+    for item in links:
+        link_url = item["url"]
+        link_text = item["text"]
+        if not same_domain_or_subdomain(link_url, domain):
+            continue
+        combined = (link_url + " " + link_text).lower()
+        if ".pdf" in combined or "datasheet" in combined or "download" in combined or "规格书" in combined:
+            pdfs.append({
+                "url": link_url,
+                "link_text": link_text,
+                "score": score_pdf_candidate(link_url, link_text, model),
+            })
+    return sorted(pdfs, key=lambda x: x["score"], reverse=True)
+
+
+def crawl_company_for_product_page(company_row: pd.Series, model: str, max_pages: int = 3) -> pd.DataFrame:
+    """产品页优先：如果官网产品表格已经有目标型号，直接返回该行数据，避免慢速 PDF 下载/扫描。"""
+    company = str(company_row.get("company_name", "")).strip()
+    domain = str(company_row.get("domain", "")).strip()
+    base_url = str(company_row.get("base_url", "")).strip()
+    search_template = str(company_row.get("search_url_template", "")).strip()
+    if not domain or not base_url:
+        return pd.DataFrame()
+
+    visited = set()
+    queue = build_seed_urls(company, base_url, search_template, model)
+    results = []
+    model_norm = normalize_model(model)
+
+    while queue and len(visited) < max_pages:
+        current_url = queue.pop(0)
+        if current_url in visited:
+            continue
+        visited.add(current_url)
+        try:
+            resp = request_url(current_url)
+            resp.raise_for_status()
+        except Exception:
+            continue
+        final_url = resp.url
+        if not same_domain_or_subdomain(final_url, domain):
+            continue
+        ctype = resp.headers.get("Content-Type", "").lower()
+        if "html" not in ctype and "text" not in ctype:
+            continue
+
+        html = resp.text
+        page_text = BeautifulSoup(html, "html.parser").get_text(" ", strip=True)
+        page_has_model = model_norm in normalize_model(page_text)
+        pdfs = extract_pdf_links_from_page(html, final_url, domain, model)
+        best_pdf = pdfs[0]["url"] if pdfs else ""
+
+        # 1) 优先使用表格行，最准确、最快
+        for row in table_rows_containing_model(html, model, final_url):
+            row.update({
+                "company_name": company,
+                "page_url": final_url,
+                "datasheet_url": best_pdf,
+                "source_kind": "官网产品页表格",
+                "page_score": 500 + score_pdf_candidate(final_url, row.get("row_text", ""), model),
+            })
+            results.append(row)
+
+        # 2) 没有表格行，但页面文本包含型号，也作为兜底
+        if page_has_model and not results:
+            results.append({
+                "company_name": company,
+                "page_url": final_url,
+                "source_url": final_url,
+                "datasheet_url": best_pdf,
+                "source_kind": "官网产品页文本",
+                "row_text": page_text[:5000],
+                "page_score": 250 + score_pdf_candidate(final_url, page_text[:1000], model),
+            })
+
+        # 3) 页面没命中时，只继续少量高相关链接，不做全站漫游
+        if not page_has_model:
+            links = extract_links_from_html(html, final_url)
+            for item in links:
+                link_url = item["url"]
+                link_text = item["text"]
+                if not same_domain_or_subdomain(link_url, domain):
+                    continue
+                combined = normalize_model(link_url + " " + link_text)
+                if model_norm in combined or any(k in link_url.lower() for k in ["product", "products", "flash", "nor", "nand"]):
+                    if link_url not in visited and len(queue) < max_pages * 2:
+                        queue.append(link_url)
+
+    if not results:
+        return pd.DataFrame()
+    df = pd.DataFrame(results).sort_values("page_score", ascending=False).drop_duplicates(subset=["page_url", "row_text"])
+    return df
+
+
+def crawl_product_pages_parallel(search_df: pd.DataFrame, model: str, max_pages: int) -> pd.DataFrame:
+    if search_df.empty:
+        return pd.DataFrame()
+    dfs = []
+    max_workers = min(4, max(1, len(search_df)))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(crawl_company_for_product_page, row, model, max_pages): row.get("company_name", "") for _, row in search_df.iterrows()}
+        for future in as_completed(futures):
+            try:
+                df = future.result()
+                if not df.empty:
+                    dfs.append(df)
+            except Exception:
+                pass
+    if not dfs:
+        return pd.DataFrame()
+    return pd.concat(dfs, ignore_index=True).sort_values("page_score", ascending=False).drop_duplicates(subset=["page_url", "row_text"])
+
+
+def spec_from_product_page_row(row: pd.Series, selected_type: str, model: str) -> dict:
+    """把官网产品页表格行转换成统一 spec。"""
+    row_text = str(row.get("row_text", ""))
+    density_text = str(row.get("density", "")) or row_text
+    vcc_text = str(row.get("vcc", "")) or row_text
+    package_text = str(row.get("package", "")) or row_text
+    temp_text = str(row.get("temperature", "")) or row_text
+
+    product_type = extract_product_type(row_text, selected_type=selected_type, model=model)
+    density_mb, density_display = parse_density_from_text(density_text)
+    if density_mb is None:
+        d = extract_density(row_text)
+        density_mb, density_display = d.get("density_mb"), d.get("display", "")
+    vmin, vmax = parse_voltage_from_text(vcc_text)
+    voltage = build_voltage_dict(vmin, vmax, "产品页")
+    package = extract_package(package_text)
+    temp = extract_temperature(temp_text)
+
+    return {
+        "product_type": product_type.get("product_type", ""),
+        "product_type_confidence": product_type.get("confidence", "产品页"),
+        "capacity": density_display or "",
+        "density_mb": density_mb,
+        "capacity_confidence": "产品页" if density_display else "低",
+        "voltage_range": voltage.get("display", ""),
+        "voltage_type": voltage.get("voltage_type", ""),
+        "vcc_min": voltage.get("vcc_min"),
+        "vcc_max": voltage.get("vcc_max"),
+        "voltage_confidence": voltage.get("confidence", "产品页"),
+        "package": package.get("package", ""),
+        "package_size": package.get("package_size", ""),
+        "package_confidence": "产品页" if package.get("package") or package.get("package_size") else "低",
+        "temperature": temp.get("display", ""),
+        "temp_grade": temp.get("temp_grade", ""),
+        "temp_min": temp.get("temp_min"),
+        "temp_max": temp.get("temp_max"),
+        "temperature_confidence": "产品页" if temp.get("display") else "低",
+    }
 
 
 def build_seed_urls(company: str, base_url: str, search_template: str, model: str) -> list[str]:
@@ -666,7 +930,7 @@ def get_pdf_response_metadata(pdf_url: str) -> dict:
     return meta
 
 
-def choose_valid_pdf(candidate_df: pd.DataFrame, model: str, max_scan_pages: int | None = None) -> tuple[bytes | None, str, pd.DataFrame, str]:
+def choose_valid_pdf(candidate_df: pd.DataFrame, model: str, max_scan_pages: int | None = None, max_candidates: int = 3) -> tuple[bytes | None, str, pd.DataFrame, str]:
     """
     V3：对候选 PDF 逐个下载后“快速扫描全文”校验目标型号。
     不再只看前几页，避免型号在 PDF 后部时误判；同时记录 final_url/Last-Modified，优先选择官网可访问、型号命中的候选。
@@ -677,7 +941,7 @@ def choose_valid_pdf(candidate_df: pd.DataFrame, model: str, max_scan_pages: int
     checked_rows = []
     valid_items = []
 
-    for _, row in candidate_df.sort_values("score", ascending=False).head(MAX_PDF_CANDIDATES).iterrows():
+    for _, row in candidate_df.sort_values("score", ascending=False).head(max_candidates).iterrows():
         url = str(row.get("url", "")).strip()
         check = row.to_dict()
         check.update(get_pdf_response_metadata(url))
@@ -1317,8 +1581,8 @@ def recommend_xtx(spec: dict, xtx_df: pd.DataFrame, weights_df: pd.DataFrame, to
 # 页面 UI
 # =========================================================
 
-st.title("🔎 竞品规格书解析与 XTX 对标推荐工具 V3")
-st.caption("V3：自动检索提速；PDF 全文快速扫描校验型号；新增产品类型；核心匹配规则为产品类型+容量+电压必须一致。")
+st.title("🔎 竞品规格书解析与 XTX 对标推荐工具 V4")
+st.caption("V4：产品页优先匹配；无 PDF 时直接解析官网产品表格；PDF 只校验少量高分候选，显著提升检索速度。")
 
 with st.sidebar:
     st.header("维护数据上传")
@@ -1332,8 +1596,11 @@ with st.sidebar:
         type=["xlsx"],
         help="如果不上传，程序会尝试读取本地 competitor_analysis_history.xlsx。",
     )
-    max_pages = st.slider("每家官网最大检索页数", min_value=3, max_value=30, value=DEFAULT_MAX_CRAWL_PAGES, step=1)
-    pdf_parse_pages = st.slider("PDF详细解析页数", min_value=5, max_value=200, value=35, step=5)
+    max_pages = st.slider("每家官网最大检索页数", min_value=1, max_value=10, value=DEFAULT_MAX_CRAWL_PAGES, step=1, help="建议 2~4。数值越大越慢。")
+    pdf_validate_limit = st.slider("最多校验 PDF 候选数", min_value=1, max_value=8, value=3, step=1, help="自动检索时最多下载并全文扫描几个高分 PDF。建议 2~3。")
+    pdf_scan_pages_input = st.slider("PDF型号快速扫描页数", min_value=0, max_value=300, value=0, step=20, help="0 表示扫描全文；非 0 表示只扫描前 N 页。型号可能靠后时用 0，但会慢一些。")
+    pdf_parse_pages = st.slider("PDF详细解析页数", min_value=5, max_value=80, value=20, step=5, help="只影响选中 PDF 后的详细字段抽取。值越大越慢，一般 20~30 页足够。")
+    product_page_first = st.checkbox("产品页优先，命中后跳过 PDF 解析", value=True, help="推荐打开。官网产品表格已包含容量/电压/封装/温度时，直接用产品页数据。")
     save_local_history = st.checkbox("保存历史到本地 xlsx", value=True, help="适合公司内网/本地部署；Streamlit Cloud 重启后本地文件可能丢失。")
 
     st.divider()
@@ -1456,36 +1723,78 @@ if run:
             st.write(search_note)
             st.write(f"本次检索厂商数：{len(search_df)}")
 
-            st.write("并发检索友商官网 PDF 候选链接...")
-            candidate_df = crawl_companies_parallel(search_df, competitor_model, max_pages=max_pages)
+            # V4：先查官网产品页。产品页表格命中后，直接用产品页数据，避免下载/扫描 PDF 导致等待过久。
+            st.write("产品页优先检索目标型号...")
+            product_page_df = crawl_product_pages_parallel(search_df, competitor_model, max_pages=max_pages)
 
-            if candidate_df.empty:
-                st.warning("未自动找到候选 PDF。建议切换到“输入 PDF 链接”或“手动上传 PDF”。")
+            if product_page_first and not product_page_df.empty:
+                best_page = product_page_df.iloc[0]
+                spec = spec_from_product_page_row(best_page, selected_type=product_type, model=competitor_model)
+                selected_pdf_url = str(best_page.get("datasheet_url", "") or best_page.get("page_url", ""))
+                candidate_df = product_page_df
+                st.write("已在官网产品页匹配到目标型号，跳过 PDF 解析。")
+                st.write(str(best_page.get("page_url", "")))
+            else:
+                st.write("未在产品页命中，开始检索官网 PDF 候选链接...")
+                candidate_df = crawl_companies_parallel(search_df, competitor_model, max_pages=max_pages)
+
+                if candidate_df.empty:
+                    if not product_page_df.empty:
+                        best_page = product_page_df.iloc[0]
+                        spec = spec_from_product_page_row(best_page, selected_type=product_type, model=competitor_model)
+                        selected_pdf_url = str(best_page.get("datasheet_url", "") or best_page.get("page_url", ""))
+                        candidate_df = product_page_df
+                        st.warning("未找到 PDF，已改用官网产品页数据。")
+                    else:
+                        st.warning("未自动找到候选 PDF，也未在产品页匹配到型号。建议切换到“输入 PDF 链接”或“手动上传 PDF”。")
+                        st.stop()
+                else:
+                    st.write("下载少量高分 PDF 并快速校验是否包含目标型号...")
+                    scan_pages = None if int(pdf_scan_pages_input) == 0 else int(pdf_scan_pages_input)
+                    pdf_bytes, selected_pdf_url, checked_df, err = choose_valid_pdf(
+                        candidate_df, competitor_model, max_scan_pages=scan_pages, max_candidates=pdf_validate_limit
+                    )
+                    candidate_df = checked_df if not checked_df.empty else candidate_df
+                    if err:
+                        if not product_page_df.empty:
+                            best_page = product_page_df.iloc[0]
+                            spec = spec_from_product_page_row(best_page, selected_type=product_type, model=competitor_model)
+                            selected_pdf_url = str(best_page.get("datasheet_url", "") or best_page.get("page_url", ""))
+                            candidate_df = product_page_df
+                            st.warning("PDF 未通过校验，已改用官网产品页数据。")
+                        else:
+                            st.error(err)
+                            st.dataframe(candidate_df, use_container_width=True)
+                            st.stop()
+                    else:
+                        st.write("已选择通过校验的 PDF：")
+                        st.write(selected_pdf_url)
+                        st.write("解析 PDF 文本...")
+                        try:
+                            pdf_text = extract_text_from_pdf_bytes(pdf_bytes, max_pages=pdf_parse_pages)
+                        except Exception as e:
+                            st.error(f"PDF 解析失败：{e}")
+                            st.stop()
+                        if not pdf_text.strip():
+                            st.error("PDF 未提取到有效文本，可能是扫描版 PDF，需要后续增加 OCR。")
+                            st.stop()
+                        st.write("抽取产品类型、容量、电压、封装、温度...")
+                        spec = analyze_spec_text(pdf_text, selected_type=product_type, model=competitor_model)
+
+        if source_mode in ["手动上传 PDF", "输入 PDF 链接"]:
+            st.write("解析 PDF 文本...")
+            try:
+                pdf_text = extract_text_from_pdf_bytes(pdf_bytes, max_pages=pdf_parse_pages)
+            except Exception as e:
+                st.error(f"PDF 解析失败：{e}")
                 st.stop()
 
-            st.write("下载候选 PDF 并校验是否包含目标型号...")
-            pdf_bytes, selected_pdf_url, checked_df, err = choose_valid_pdf(candidate_df, competitor_model, max_scan_pages=None)
-            candidate_df = checked_df if not checked_df.empty else candidate_df
-            if err:
-                st.error(err)
-                st.dataframe(candidate_df, use_container_width=True)
+            if not pdf_text.strip():
+                st.error("PDF 未提取到有效文本，可能是扫描版 PDF，需要后续增加 OCR。")
                 st.stop()
-            st.write("已选择通过校验的 PDF：")
-            st.write(selected_pdf_url)
 
-        st.write("解析 PDF 文本...")
-        try:
-            pdf_text = extract_text_from_pdf_bytes(pdf_bytes, max_pages=pdf_parse_pages)
-        except Exception as e:
-            st.error(f"PDF 解析失败：{e}")
-            st.stop()
-
-        if not pdf_text.strip():
-            st.error("PDF 未提取到有效文本，可能是扫描版 PDF，需要后续增加 OCR。")
-            st.stop()
-
-        st.write("抽取产品类型、容量、电压、封装、温度...")
-        spec = analyze_spec_text(pdf_text, selected_type=product_type, model=competitor_model)
+            st.write("抽取产品类型、容量、电压、封装、温度...")
+            spec = analyze_spec_text(pdf_text, selected_type=product_type, model=competitor_model)
 
         st.session_state["last_result"] = {
             "spec": spec,
@@ -1530,14 +1839,14 @@ if "last_result" in st.session_state:
     if result.get("search_note"):
         st.info(result["search_note"])
 
-    st.markdown("**规格书来源：**")
+    st.markdown("**规格书 / 产品页来源：**")
     if str(selected_pdf_url).startswith("http"):
         st.markdown(f"[打开规格书 PDF]({selected_pdf_url})")
     else:
         st.write(selected_pdf_url)
 
     if not candidate_df.empty:
-        with st.expander("查看自动检索到的 PDF 候选链接和校验结果"):
+        with st.expander("查看自动检索到的产品页 / PDF 候选链接和校验结果"):
             st.dataframe(candidate_df, use_container_width=True)
 
     st.divider()
@@ -1686,7 +1995,7 @@ st.download_button(
 with st.expander("使用说明 / 限制"):
     st.markdown(
         """
-### V2 关键变化
+### V4 关键变化
 
 1. **自动检索速度优化**  
    - 根据 `Company_Master.model_prefixes` 或内置型号前缀规则，先锁定可能的友商。  
@@ -1695,7 +2004,7 @@ with st.expander("使用说明 / 限制"):
 
 2. **避免错抓规格书**  
    - 候选 PDF 必须来自对应友商的白名单域名。  
-   - 下载 PDF 后，会解析前几页并校验是否包含输入型号；不包含则跳过。  
+   - 下载 PDF 后，会优先解析官网产品页；只有需要使用 PDF 时才下载少量高分候选并扫描型号；不包含则跳过。  
    - 因此不会再把 BY25D20AS 匹配到其他公司的 GT25Q32A PDF。
 
 3. **推荐规则更严格**  
